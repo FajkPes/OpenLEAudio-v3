@@ -1,4 +1,4 @@
-# OpenLEAudio 1.0
+# OpenLEAudio 3.0
 
 First release considered ready for everyday use. The headline is connection
 reliability: three separate faults made the stack look like broken headphone
@@ -113,7 +113,7 @@ firmware, and all three are fixed.
 
 ## Install
 
-1. Download `OpenLEAudio-1.0-win-x64.zip` below.
+1. Download `OpenLEAudio-3.0-win-x64.zip` below.
 2. Extract it somewhere writable.
 3. Run `START OpenLEAudio.bat`.
 4. Complete the four steps on the Setup page.

@@ -1,4 +1,4 @@
-# OpenLEAudio 1.0 for Windows x64
+# OpenLEAudio 3.0 for Windows x64
 
 This directory is the ready-to-run end-user package. It does not contain source code, tests, packet captures, or development tools.
 

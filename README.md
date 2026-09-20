@@ -87,7 +87,7 @@ limiter.
 
 ## Status
 
-Version 1.0 is the first release considered ready for everyday use, and it still
+Version 3.0 is the first release considered ready for everyday use, and it still
 changes a driver binding on your machine. Use a dedicated USB Bluetooth adapter,
 keep a Windows-stack adapter available when possible, and use the included
 restore tool if you need to return the selected adapter to the Windows driver.
