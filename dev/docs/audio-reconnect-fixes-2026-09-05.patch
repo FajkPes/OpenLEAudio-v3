@@ -1,0 +1,887 @@
+--- before/audio.rs
++++ after/audio.rs
+@@ -214,50 +214,44 @@
+     }
+ }
+ 
+-/// Rate-converts an interleaved block to an exact number of output frames.
+-///
+-/// Linear interpolation between neighbouring samples, per channel. Nearest
+-/// neighbour is cheaper and is what the monitoring path uses, but it is audible
+-/// on music: dropping and repeating samples puts a rough, grainy edge on
+-/// anything with sustained high frequencies. Linear costs one multiply per
+-/// sample and this runs on a few hundred of them per frame.
+-///
+-/// It is not a substitute for setting the cable to the right rate. A proper
+-/// band-limited resampler would be better still; this exists so that a
+-/// configuration below 48 kHz plays at all rather than failing outright.
+-fn resample_interleaved(source: &[i16], channels: usize, output_frames: usize) -> Vec<i16> {
+-    if channels == 0 || output_frames == 0 || source.is_empty() {
+-        return Vec::new();
+-    }
+-
+-    let input_frames = source.len() / channels;
+-    if input_frames == 0 {
+-        return Vec::new();
+-    }
+-
+-    let mut out = Vec::with_capacity(output_frames * channels);
+-    // The last output frame maps to the last input frame, so the two blocks
+-    // line up at both ends and no gap opens up between consecutive frames.
+-    let step = if output_frames > 1 {
+-        (input_frames - 1) as f32 / (output_frames - 1) as f32
+-    } else {
+-        0.0
+-    };
+-
+-    for index in 0..output_frames {
+-        let position = index as f32 * step;
+-        let left = position.floor() as usize;
+-        let right = (left + 1).min(input_frames - 1);
+-        let fraction = position - left as f32;
+-
++/// Pull a continuous interleaved stream using an exact rational source position.
++/// Linear interpolation uses one source frame of look-ahead, per channel.
++/// An underrun leaves both the queue and phase untouched. Equal rates bypass
++/// interpolation, preserving the original samples and channel order exactly.
++/// This is not an anti-aliasing filter; matching the cable rate is preferable.
++fn pull_resampled(
++    pending: &mut VecDeque<i16>, phase: &mut u64, source_rate: u32,
++    output_rate: u32, channels: usize, output_frames: usize,
++) -> Option<Vec<i16>> {
++    if output_rate == 0 || source_rate == 0 || channels == 0 { return None; }
++    if output_frames == 0 { return Some(Vec::new()); }
++    let denominator = output_rate as u64;
++    let end = *phase + output_frames as u64 * source_rate as u64;
++    let consumed = (end / denominator) as usize;
++    let last = *phase + (output_frames - 1) as u64 * source_rate as u64;
++    let required = consumed.max((last / denominator) as usize + 1
++        + usize::from(last % denominator != 0));
++    if pending.len() / channels < required { return None; }
++    if source_rate == output_rate && *phase == 0 {
++        return Some(pending.drain(..output_frames * channels).collect());
++    }
++    let mut output = Vec::with_capacity(output_frames * channels);
++    for frame in 0..output_frames {
++        let position = *phase + frame as u64 * source_rate as u64;
++        let left = (position / denominator) as usize;
++        let fraction = (position % denominator) as f32 / denominator as f32;
+         for channel in 0..channels {
+-            let a = source[left * channels + channel] as f32;
+-            let b = source[right * channels + channel] as f32;
+-            out.push((a + (b - a) * fraction) as i16);
+-        }
+-    }
+-
+-    out
++            let a = pending[left * channels + channel];
++            let value = if fraction == 0.0 { a } else {
++                let b = pending[(left + 1) * channels + channel];
++                (a as f32 + (b as f32 - a as f32) * fraction) as i16
++            };
++            output.push(value);
++        }
++    }
++    pending.drain(..consumed * channels);
++    *phase = end % denominator;
++    Some(output)
+ }
+ 
+ /// Initialises COM for this thread. Safe to call more than once.
+@@ -531,6 +525,8 @@
+     float_samples: bool,
+     /// Samples read from the device but not yet consumed by the encoder.
+     pending: VecDeque<i16>,
++    resample_phase: u64,
++    resample_output_rate: u32,
+ }
+ 
+ impl AudioCapture {
+@@ -625,6 +621,8 @@
+                 bits_per_sample,
+                 float_samples,
+                 pending: VecDeque::with_capacity(8192),
++                resample_phase: 0,
++                resample_output_rate: expected_rate.unwrap_or(sample_rate),
+             })
+         }
+     }
+@@ -689,6 +687,7 @@
+                 const DATA_DISCONTINUITY: u32 = 0x1;
+                 if flags & DATA_DISCONTINUITY != 0 {
+                     self.pending.clear();
++                    self.resample_phase = 0;
+                 }
+ 
+                 // AUDCLNT_BUFFERFLAGS_SILENT means the buffer contents are undefined
+@@ -761,38 +760,21 @@
+     /// Returning None rather than a short frame matters: LC3 encodes fixed-size
+     /// blocks, and a partial one would shift every later frame out of alignment.
+     pub fn next_frame(&mut self, samples_per_channel: usize) -> Result<Option<Vec<i16>>> {
+-        // How many of the device's own frames make up one of ours. Rounded up,
+-        // so the resampler is never asked to invent the tail of a frame.
+-        let source_per_channel = if self.sample_rate == self.target_rate {
+-            samples_per_channel
+-        } else {
+-            ((samples_per_channel as u64 * self.sample_rate as u64
+-                + self.target_rate as u64
+-                - 1)
+-                / self.target_rate as u64) as usize
+-        };
+-
+-        let needed = source_per_channel * self.channels as usize;
+-
+-        if self.pending.len() < needed {
+-            self.drain_device()?;
+-        }
+-
+-        if self.pending.len() < needed {
+-            return Ok(None);
+-        }
+-
+-        let frame: Vec<i16> = self.pending.drain(..needed).collect();
+-
+-        if self.sample_rate == self.target_rate {
+-            return Ok(Some(frame));
+-        }
+-
+-        Ok(Some(resample_interleaved(
+-            &frame,
+-            self.channels as usize,
+-            samples_per_channel,
+-        )))
++        self.next_resampled_frame(samples_per_channel, self.target_rate)
++    }
++
++    fn next_resampled_frame(&mut self, frames: usize, rate: u32) -> Result<Option<Vec<i16>>> {
++        if self.resample_output_rate != rate {
++            self.resample_phase = 0;
++            self.resample_output_rate = rate;
++        }
++        if let Some(samples) = pull_resampled(&mut self.pending, &mut self.resample_phase,
++            self.sample_rate, rate, self.channels as usize, frames) {
++            return Ok(Some(samples));
++        }
++        self.drain_device()?;
++        Ok(pull_resampled(&mut self.pending, &mut self.resample_phase,
++            self.sample_rate, rate, self.channels as usize, frames))
+     }
+ 
+     /// Returns one mono monitoring frame at `output_rate`. All input channels
+@@ -806,31 +788,13 @@
+         if output_samples == 0 || output_rate == 0 {
+             return Ok(Some(Vec::new()));
+         }
+-        let input_frames = ((output_samples as u64 * self.sample_rate as u64
+-            + output_rate as u64 - 1)
+-            / output_rate as u64)
+-            .max(1) as usize;
+-        let needed = input_frames * self.channels as usize;
+-        if self.pending.len() < needed {
+-            self.drain_device()?;
+-        }
+-        if self.pending.len() < needed {
++        let Some(interleaved) = self.next_resampled_frame(output_samples, output_rate)? else {
+             return Ok(None);
+-        }
+-
+-        let interleaved: Vec<i16> = self.pending.drain(..needed).collect();
+-        let mono: Vec<i16> = interleaved
+-            .chunks_exact(self.channels as usize)
+-            .map(|frame| {
+-                let sum: i32 = frame.iter().map(|&sample| sample as i32).sum();
+-                (sum / self.channels as i32) as i16
+-            })
+-            .collect();
+-        Ok(Some(
+-            (0..output_samples)
+-                .map(|index| mono[index * mono.len() / output_samples])
+-                .collect(),
+-        ))
++        };
++        Ok(Some(interleaved.chunks_exact(self.channels as usize).map(|frame| {
++            let sum: i32 = frame.iter().map(|&sample| sample as i32).sum();
++            (sum / self.channels as i32) as i16
++        }).collect()))
+     }
+ 
+     /// Level of each channel of an interleaved frame, in dBFS.
+@@ -973,6 +937,7 @@
+     /// Drops buffered audio, used after an underrun so latency does not accumulate.
+     pub fn flush(&mut self) {
+         self.pending.clear();
++        self.resample_phase = 0;
+     }
+ }
+ 
+@@ -1254,47 +1219,68 @@
+ 
+     #[test]
+     fn resampling_keeps_the_channels_apart() {
+-        // Left is a ramp, right is its negative. If the two ever mixed, the
+-        // sum would stop being zero - which is exactly the failure that would
+-        // otherwise be heard as the stereo image collapsing.
+-        let source: Vec<i16> = (0..8i16).flat_map(|n| [n * 100, -n * 100]).collect();
+-
+-        let out = resample_interleaved(&source, 2, 4);
+-
+-        assert_eq!(out.len(), 8);
+-        for pair in out.chunks_exact(2) {
+-            assert_eq!(pair[0], -pair[1]);
+-        }
++        let mut source: VecDeque<i16> = (0..8i16).flat_map(|n| [n * 100, -n * 100]).collect();
++        let out = pull_resampled(&mut source, &mut 0, 48000, 24000, 2, 4).unwrap();
++        assert_eq!(out, vec![0, 0, 200, -200, 400, -400, 600, -600]);
+     }
+ 
+     #[test]
+-    fn resampling_produces_exactly_the_frames_asked_for() {
+-        // The encoder takes fixed-size blocks, so a frame that is one sample
+-        // short shifts every later frame out of alignment.
+-        let source: Vec<i16> = (0..100i16).flat_map(|n| [n, n]).collect();
+-
+-        for wanted in [1usize, 7, 64, 480] {
+-            assert_eq!(resample_interleaved(&source, 2, wanted).len(), wanted * 2);
+-        }
++    fn fractional_resampling_has_no_cumulative_rounding_drift() {
++        // Linear interpolation needs one look-ahead frame, retained for the
++        // next block. This is fixed headroom, not extra consumption per block.
++        let mut source = VecDeque::from(vec![100i16; 132301 * 2]);
++        let mut phase = 0;
++        for _ in 0..400 {
++            assert_eq!(pull_resampled(&mut source, &mut phase, 44100, 48000, 2, 360)
++                .expect("three seconds of source must supply three seconds of output").len(), 720);
++        }
++        assert_eq!(source.len(), 2, "only the look-ahead stereo frame remains");
++        assert_eq!(phase, 0);
+     }
+ 
+     #[test]
+-    fn resampling_spans_the_whole_input() {
+-        // Both ends must line up, or consecutive frames leave a gap between
+-        // them and the result clicks once per frame.
+-        let source: Vec<i16> = (0..9i16).flat_map(|n| [n * 1000, n * 1000]).collect();
+-
+-        let out = resample_interleaved(&source, 2, 5);
+-
+-        assert_eq!(out[0], 0);
+-        assert_eq!(out[out.len() - 2], 8000);
++    fn resampling_is_continuous_across_arbitrary_frame_boundaries() {
++        for (input_rate, output_rate) in [(44100, 48000), (48000, 44100), (48000, 16000)] {
++            let mut source: VecDeque<i16> = (0..20000).flat_map(|i| {
++                let value = ((i as f32 * 0.037).sin() * 20000.0) as i16;
++                [value, -value]
++            }).collect();
++            let mut blocks = source.clone();
++            let expected = pull_resampled(&mut source, &mut 0, input_rate, output_rate, 2, 1440).unwrap();
++            let mut phase = 0;
++            let mut actual = Vec::new();
++            for size in [137, 223, 360, 719, 1] {
++                actual.extend(pull_resampled(&mut blocks, &mut phase, input_rate, output_rate, 2, size).unwrap());
++            }
++            assert_eq!(actual, expected);
++            assert_eq!(source, blocks);
++        }
+     }
+ 
+     #[test]
+-    fn resampling_an_empty_block_is_empty_rather_than_a_panic() {
+-        assert!(resample_interleaved(&[], 2, 10).is_empty());
+-        assert!(resample_interleaved(&[1, 2], 2, 0).is_empty());
+-        assert!(resample_interleaved(&[1, 2], 0, 4).is_empty());
++    fn resampling_underrun_preserves_samples_and_phase() {
++        let mut source = VecDeque::from(vec![100, -100, 200, -200]);
++        let before = source.clone();
++        let mut phase = 123;
++        assert!(pull_resampled(&mut source, &mut phase, 44100, 48000, 2, 360).is_none());
++        assert_eq!(source, before);
++        assert_eq!(phase, 123);
++    }
++
++    #[test]
++    fn equal_rates_preserve_every_sample_and_stereo_position() {
++        let expected = vec![i16::MIN, i16::MAX, -1234, 5678, 1, -2];
++        let mut source = VecDeque::from(expected.clone());
++        assert_eq!(pull_resampled(&mut source, &mut 0, 48000, 48000, 2, 3).unwrap(), expected);
++        assert!(source.is_empty());
++    }
++
++    #[test]
++    fn empty_resampling_does_not_panic_or_consume_input() {
++        let mut source = VecDeque::new();
++        assert!(pull_resampled(&mut source, &mut 0, 48000, 24000, 2, 1).is_none());
++        assert_eq!(pull_resampled(&mut source, &mut 0, 48000, 24000, 2, 0), Some(vec![]));
++        assert!(pull_resampled(&mut source, &mut 0, 48000, 0, 2, 4).is_none());
+     }
+ 
+     #[test]
+--- before/controller.rs
++++ after/controller.rs
+@@ -40,6 +40,12 @@
+ 
+     #[error("controller did not send anything in time - is firmware loaded?")]
+     EventTimeout,
++
++    #[error("encryption failed with status {status:#04x}")]
++    EncryptionRejected { status: u8 },
++
++    #[error("connection ended during encryption (reason {reason:#04x})")]
++    Disconnected { reason: u8 },
+ }
+ 
+ type Result<T> = std::result::Result<T, ControllerError>;
+@@ -562,13 +568,17 @@
+         self.command(&hci::le_enable_encryption(handle, long_term_key))?;
+ 
+         let event = self.wait_for_event(timeout, |e| {
+-            hci::parse_encryption_change(e).map(|(h, _)| h) == Some(handle)
++            hci::parse_encryption_result(e).map(|(h, _, _)| h) == Some(handle)
++                || hci::parse_disconnection_complete(e).map(|(h, _)| h) == Some(handle)
+         })?;
+-
+-        Ok(event
+-            .and_then(|e| hci::parse_encryption_change(&e))
+-            .map(|(_, enabled)| enabled)
+-            .unwrap_or(false))
++        let event = event.ok_or(ControllerError::EventTimeout)?;
++        if let Some((_, reason)) = hci::parse_disconnection_complete(&event) {
++            return Err(ControllerError::Disconnected { reason });
++        }
++        let (_, status, enabled) = hci::parse_encryption_result(&event)
++            .ok_or(ControllerError::MalformedEvent)?;
++        if status != 0 { return Err(ControllerError::EncryptionRejected { status }); }
++        Ok(enabled)
+     }
+ 
+     /// The underlying transport, for layers that need their own reader.
+--- before/hci.rs
++++ after/hci.rs
+@@ -555,6 +555,13 @@
+     Some((handle, event.params[3] != 0x00))
+ }
+ 
++/// Encryption Change including a controller-reported failure status.
++pub fn parse_encryption_result(event: &Event) -> Option<(u16, u8, bool)> {
++    if event.code != 0x08 || event.params.len() < 4 { return None; }
++    Some((u16::from_le_bytes([event.params[1], event.params[2]]) & 0x0fff,
++          event.params[0], event.params[3] != 0))
++}
++
+ /// Parses Disconnection Complete, returning the handle and the reason code.
+ ///
+ /// Worth watching during any wait for data: once the link is gone nothing will
+@@ -1038,3 +1045,19 @@
+     }
+ 
+ }
++
++#[cfg(test)]
++mod audit_regression_tests {
++    use super::*;
++    #[test]
++    fn encryption_failure_is_not_discarded_as_an_unrelated_event() {
++        let event = Event { code: 0x08, params: vec![0x06, 0x17, 0, 0] };
++        assert_eq!(parse_encryption_result(&event), Some((0x17, 0x06, false)));
++        assert_eq!(parse_encryption_change(&event), None);
++        let short = Event { code: 0x08, params: vec![0, 0x17] };
++        assert_eq!(parse_encryption_result(&short), None);
++        let success = Event { code: 0x08, params: vec![0, 0x17, 0, 1] };
++        assert_eq!(parse_encryption_result(&success), Some((0x17, 0, true)));
++    }
++
++}
+--- before/safety.rs
++++ after/safety.rs
+@@ -232,27 +232,39 @@
+     /// before a frame is refused: almost entirely at the rails, *and* changing
+     /// sign like noise.
+     pub fn screen_frame(&self, samples: &[i16]) -> Result<(), SafetyViolation> {
+-        // Below this there is not enough evidence to judge shape at all.
+-        if samples.len() < 32 {
++        self.screen_interleaved(samples, 1)
++    }
++
++    /// Screen each channel's timeline independently. Never compare L to R.
++    /// This does not modify samples or change their channel order.
++    pub fn screen_interleaved(&self, samples: &[i16], channels: usize) -> Result<(), SafetyViolation> {
++        if channels == 0 { return Ok(()); }
++        for channel in 0..channels {
++            self.screen_channel(samples.iter().skip(channel).step_by(channels).copied())?;
++        }
++        Ok(())
++    }
++
++    fn screen_channel(&self, samples: impl Iterator<Item = i16> + Clone) -> Result<(), SafetyViolation> {
++        let count = samples.clone().count();
++        if count < 32 {
+             return Ok(());
+         }
+ 
+         let rail = (i16::MAX as f32 * 0.98) as i16;
+-        let railed = samples.iter().filter(|&&s| s.saturating_abs() > rail).count();
++        let railed = samples.clone().filter(|s| s.saturating_abs() > rail).count();
+ 
+         // Nine tenths of a frame, not half. Half is ordinary loud audio.
+-        if railed * 10 <= samples.len() * 9 {
++        if railed * 10 <= count * 9 {
+             return Ok(());
+         }
+ 
+-        let flips = samples
+-            .windows(2)
+-            .filter(|pair| (pair[0] < 0) != (pair[1] < 0))
+-            .count();
++        let flips = samples.clone().zip(samples.skip(1))
++            .filter(|(a, b)| (*a < 0) != (*b < 0)).count();
+ 
+         // Random noise flips on about half of all steps. Real audio, however
+         // loud, has to reach the opposite rail to flip, so it cannot.
+-        if flips * 5 < (samples.len() - 1) * 2 {
++        if flips * 5 < (count - 1) * 2 {
+             return Ok(());
+         }
+ 
+@@ -512,3 +524,23 @@
+         assert!(check_stream_parameters(100, 10_000, 2, 1).is_err());
+     }
+ }
++
++#[cfg(test)]
++mod audit_regression_tests {
++    use super::*;
++    #[test]
++    fn opposite_polarity_stereo_is_not_mistaken_for_noise() {
++        let left: Vec<i16> = (0..480).map(|i| if (i / 120) % 2 == 0 { 32767 } else { -32767 }).collect();
++        let stereo: Vec<i16> = left.iter().flat_map(|&l| [l, -l]).collect();
++        let original = stereo.clone();
++        assert!(OutputLimiter::transparent().screen_interleaved(&stereo, 2).is_ok());
++        assert_eq!(stereo, original, "screening must never touch routing or PCM");
++    }
++
++    #[test]
++    fn noise_in_one_ear_is_still_rejected() {
++        let stereo: Vec<i16> = (0..480).flat_map(|i| [0, if i % 2 == 0 { 32767 } else { -32767 }]).collect();
++        assert!(OutputLimiter::transparent().screen_interleaved(&stereo, 2).is_err());
++    }
++
++}
+--- before/session.rs
++++ after/session.rs
+@@ -57,6 +57,9 @@
+ 
+     #[error("pairing succeeded but encryption did not start")]
+     EncryptionFailed,
++
++    #[error("battery ATT read timed out; the connection must be reopened")]
++    BatteryReadTimeout,
+ 
+     #[error(transparent)]
+     Pairing(#[from] crate::smp::SmpError),
+@@ -502,6 +505,16 @@
+     }
+ }
+ 
++fn battery_read_error(payload: &[u8], handle: u16) -> bool {
++    payload.len() == 5 && payload[0] == crate::att::att_op::ERROR_RESPONSE
++        && payload[1] == crate::att::att_op::READ_REQUEST
++        && u16::from_le_bytes([payload[2], payload[3]]) == handle
++}
++
++fn silence_release_timeout(timeout: Option<Duration>, microphone_active: bool) -> Option<Duration> {
++    if microphone_active { None } else { timeout }
++}
++
+ fn is_silent(samples: &[i16]) -> bool {
+     const FLOOR: i16 = 16; // about -66 dBFS
+     samples.iter().all(|s| s.saturating_abs() <= FLOOR)
+@@ -677,6 +690,8 @@
+     /// False means something else has it - in practice a phone. Starts true:
+     /// a device that never publishes contexts must not be treated as busy.
+     media_available: bool,
++    /// Keep the wake-up frame separate from capture discontinuities during setup.
++    resume_capture: Option<(String, u32, AudioCapture, Vec<i16>)>,
+ }
+ 
+ impl Session {
+@@ -690,6 +705,7 @@
+             batteries: Vec::new(),
+             contexts_handle: None,
+             media_available: true,
++            resume_capture: None,
+         }
+     }
+ 
+@@ -1749,7 +1765,11 @@
+         let sample_rate = plan.codec.sampling_frequency.hz().unwrap_or(48_000);
+ 
+         let capture_device = device.name.clone();
+-        let mut capture = AudioCapture::open(&device.id, sample_rate)?;
++        let (mut capture, mut wake_frame) = match self.resume_capture.take() {
++            Some((id, rate, capture, frame)) if id == device.id && rate == sample_rate =>
++                (capture, Some(frame)),
++            _ => (AudioCapture::open(&device.id, sample_rate)?, None),
++        };
+ 
+         report(Progress::CaptureReady {
+             device: capture_device,
+@@ -1852,12 +1872,10 @@
+         let mut soft_start =
+             crate::safety::SoftStart::over(300, plan.qos.sdu_interval_us);
+ 
+-        // Silence still costs both radios a packet every interval. Stopping the
+-        // transmission leaves the CIS and the connection standing, so sound
+-        // resumes on the next frame with no renegotiation.
+-        let idle_timeout = self.config.idle_timeout;
++        // A microphone session must stay live even when PC playback is silent.
++        // Silence release tears down the entire ISO group, including its source.
++        let idle_timeout = silence_release_timeout(self.config.idle_timeout, plan.microphone.is_some());
+         let mut silent_since: Option<Instant> = None;
+-        let mut idle = false;
+ 
+         // Prime both channels with silence before real audio starts.
+         //
+@@ -2016,12 +2034,9 @@
+                 return Ok(());
+             }
+ 
+-            // Nothing is being transmitted while idle, so there is nothing to
+-            // measure and nobody watching a number that cannot change. Every
+-            // question skipped here is a USB transfer and a moment of the
+-            // controller's attention saved, for as long as the silence lasts -
+-            // which for headphones worn all day is most of the day.
+-            let metrics = if idle { MetricsLevel::Off } else { self.config.metrics };
++            // This loop always transmits. Silence release exits into wait_for_sound,
++            // where diagnostics are not polled.
++            let metrics = self.config.metrics;
+             let diagnostic_slots = match metrics {
+                 MetricsLevel::Off => 0,
+                 MetricsLevel::Signal => 1,
+@@ -2096,6 +2111,9 @@
+             // that is already carrying audio, so the honest cost is tiny - but
+             // it is not nothing, which is why nothing here happens on its own
+             // unless the user turned the poll on.
++            if pending_battery.is_some() && battery_asked_at.elapsed() >= Duration::from_secs(30) {
++                return Err(SessionError::BatteryReadTimeout);
++            }
+             if let Some(handle) = acl_handle {
+                 let asked_for = self
+                     .config
+@@ -2111,6 +2129,9 @@
+                         .battery_poll
+                         .is_some_and(|every| battery_asked_at.elapsed() >= every);
+ 
++                if asked_for && pending_battery.is_some() {
++                    self.config.battery_refresh.store(true, Ordering::Relaxed);
++                }
+                 if pending_battery.is_none() && (asked_for || due) {
+                     let candidate = if asked_for {
+                         self.batteries.first()
+@@ -2197,6 +2218,11 @@
+                     // handle it answers, so it is matched against the request
+                     // still outstanding. Only one is ever in flight.
+                     if let Some(handle) = pending_battery {
++                        if frame.cid == crate::att::cid::ATT && battery_read_error(&frame.payload, handle) {
++                            pending_battery = None;
++                            crate::trace::note("battery read refused; retrying at the next polling interval");
++                            continue;
++                        }
+                         if frame.cid == crate::att::cid::ATT
+                             && frame.payload.first() == Some(&crate::att::att_op::READ_RESPONSE)
+                         {
+@@ -2260,7 +2286,11 @@
+             // frame went out immediately instead of on time, and the one after
+             // that was late. That is most of the audio "cutting out" during
+             // ordinary use.
+-            let mut samples = match capture.next_frame(encoder.samples_per_frame())? {
++            let next_samples = match wake_frame.take() {
++                Some(frame) if frame.len() == encoder.samples_per_frame() * 2 => Some(frame),
++                _ => capture.next_frame(encoder.samples_per_frame())?,
++            };
++            let mut samples = match next_samples {
+                 Some(samples) => samples,
+                 None => {
+                     underruns += 1;
+@@ -2319,7 +2349,7 @@
+             // Otherwise loud but valid boosted music could be mistaken for
+             // decoder garbage and stop the stream.
+             let limiter = OutputLimiter::with_gain(live.output_gain.clamp(0.0, 2.0));
+-            if let Err(violation) = limiter.screen_frame(&samples) {
++            if let Err(violation) = limiter.screen_interleaved(&samples, 2) {
+                 // Refuse the frame, not the connection. Dropping the link over
+                 // one 7.5 ms window means a single loud moment in a game takes
+                 // the headphones off someone's head, which is a far worse
+@@ -2383,12 +2413,6 @@
+                 let _ = *silent_since.get_or_insert_with(Instant::now);
+             } else {
+                 silent_since = None;
+-                if idle {
+-                    idle = false;
+-                    soft_start = crate::safety::SoftStart::over(60, plan.qos.sdu_interval_us);
+-                    crate::trace::note("zvuk se vratil, pokracujeme");
+-                    report(Progress::Resumed);
+-                }
+             }
+ 
+             if let (Some(limit), Some(since)) = (idle_timeout, silent_since) {
+@@ -2409,66 +2433,11 @@
+                 }
+             }
+ 
+-            // Only meaningful while transmitting. An idle pause has nothing to
+-            // confirm, and a stream that has just resumed has not had time to.
+-            if !idle {
+-                const STALLED_AFTER: Duration = Duration::from_secs(5);
+-                if last_delivery.elapsed() >= STALLED_AFTER {
+-                    return Err(SessionError::DeliveryStalled {
+-                        seconds: last_delivery.elapsed().as_secs(),
+-                    });
+-                }
+-            } else {
+-                last_delivery = Instant::now();
+-            }
+-
+-            if idle {
+-                // Nothing is being sent, so there is no cadence to hold. Waking
+-                // every 7.5 ms to look at silence is a hundred and thirty
+-                // needless wake-ups a second, and while idle every one of them
+-                // is spent confirming that nothing happened.
+-                //
+-                // Waiting longer means more than one frame accumulates between
+-                // looks, so every frame that arrived has to be examined - not
+-                // just the first. Taking one and sleeping again would let the
+-                // capture buffer fill until Windows declared an overrun, and the
+-                // audio would come back with a glitch and a backlog. Examining
+-                // them all and discarding the silence keeps the buffer empty and
+-                // still notices sound in the first frame that contains any.
+-                const IDLE_POLL: Duration = Duration::from_millis(40);
+-
+-                let mut woke = false;
+-                loop {
+-                    let Some(next) = capture.next_frame(encoder.samples_per_frame())? else {
+-                        break;
+-                    };
+-                    if !is_silent(&next) {
+-                        woke = true;
+-                        break;
+-                    }
+-                }
+-
+-                if woke {
+-                    // Leave idle here rather than waiting for the next pass, so
+-                    // the sound that woke us is the sound that gets sent.
+-                    idle = false;
+-                    silent_since = None;
+-                    soft_start = crate::safety::SoftStart::over(60, plan.qos.sdu_interval_us);
+-                    crate::trace::note("zvuk se vratil, pokracujeme");
+-                    report(Progress::Resumed);
+-                    next_deadline = Instant::now();
+-                    continue;
+-                }
+-
+-                // The deadline is carried forward rather than reset, so the
+-                // first real frame after the silence lands on the grid instead
+-                // of wherever the coarse wait happened to end.
+-                let now = Instant::now();
+-                while next_deadline <= now {
+-                    next_deadline += frame_interval;
+-                }
+-                clock.sleep(IDLE_POLL.min(next_deadline.saturating_duration_since(now)));
+-                continue;
++            const STALLED_AFTER: Duration = Duration::from_secs(5);
++            if last_delivery.elapsed() >= STALLED_AFTER {
++                return Err(SessionError::DeliveryStalled {
++                    seconds: last_delivery.elapsed().as_secs(),
++                });
+             }
+ 
+             let mut failure = None;
+@@ -2486,12 +2455,7 @@
+                 // a dropped link, and reporting it as one would send us hunting
+                 // the radio instead of the transport. Say which it was.
+                 report(Progress::Stopped { reason: e.to_string() });
+-                return match e {
+-                    // A dropped link ends playback; anything else is a fault
+-                    // worth reporting as one.
+-                    SessionError::Transport(crate::transport::TransportError::Usb(_)) => Ok(()),
+-                    other => Err(other),
+-                };
++                return Err(e);
+             }
+ 
+             frames_sent += 1;
+@@ -2670,10 +2634,10 @@
+ 
+             let contexts_restored = was_busy && self.media_available;
+ 
+-            let mut heard = false;
++            let mut heard = None;
+             while let Some(samples) = capture.next_frame(frame)? {
+                 if !is_silent(&samples) {
+-                    heard = true;
++                    heard = Some(samples);
+                     break;
+                 }
+             }
+@@ -2700,7 +2664,10 @@
+             // two seconds before resuming is two seconds of missing audio every
+             // time somebody presses play.
+             let settled = !was_busy || started.elapsed() >= SETTLE;
+-            if welcome && (heard || contexts_restored) && settled {
++            if welcome && (heard.is_some() || contexts_restored) && settled {
++                if let Some(samples) = heard {
++                    self.resume_capture = Some((device.id.clone(), sample_rate, capture, samples));
++                }
+                 return Ok(true);
+             }
+ 
+@@ -2848,6 +2815,7 @@
+     /// the teardown, which is how a reconnect ends up failing for reasons that
+     /// have nothing to do with the peer.
+     pub fn disconnect(&mut self, handle: u16) {
++        self.resume_capture = None;
+         let Some(controller) = self.controller.as_mut() else {
+             return;
+         };
+@@ -2873,6 +2841,7 @@
+     /// are blocked inside a read and each holds the transport alive. Waking them
+     /// first is what actually closes the handle.
+     pub fn shutdown(&mut self) {
++        self.resume_capture = None;
+         if let Some(controller) = self.controller.as_ref() {
+             controller.transport().abort_reads();
+         }
+@@ -3194,3 +3163,24 @@
+         assert!(parse_address("nonsense").is_none());
+     }
+ }
++
++#[cfg(test)]
++mod audit_regression_tests {
++    use super::*;
++    #[test]
++    fn silence_must_not_release_an_active_microphone() {
++        let timeout = Some(Duration::from_secs(10));
++        assert_eq!(silence_release_timeout(timeout, true), None);
++        assert_eq!(silence_release_timeout(timeout, false), timeout);
++        assert_eq!(silence_release_timeout(None, false), None);
++    }
++
++    #[test]
++    fn only_a_matching_battery_read_error_completes_the_request() {
++        assert!(battery_read_error(&[0x01, 0x0a, 0x34, 0x12, 0x05], 0x1234));
++        assert!(!battery_read_error(&[0x01, 0x0a, 0x34, 0x12, 0x05], 0x5678));
++        assert!(!battery_read_error(&[0x01, 0x12, 0x34, 0x12, 0x05], 0x1234));
++        assert!(!battery_read_error(&[0x01, 0x0a], 0x1234));
++    }
++
++}
+--- before/bin/agent.rs
++++ after/bin/agent.rs
+@@ -252,6 +252,14 @@
+         && !trimmed.eq_ignore_ascii_case(address)
+         && !trimmed.eq_ignore_ascii_case("(unnamed)")
+         && !trimmed.eq_ignore_ascii_case("(bez jmena)")
++}
++
++/// Only an explicit authentication/key error permits replacement pairing.
++/// A timeout, USB failure or disconnect leaves the existing bond intact.
++fn saved_key_rejected(error: &olea_core::session::SessionError) -> bool {
++    matches!(error, olea_core::session::SessionError::Controller(
++        olea_core::controller::ControllerError::EncryptionRejected { status: 0x05 | 0x06 }
++    ))
+ }
+ 
+ /// Errors caused solely by saved choices cannot improve by reconnecting. A
+@@ -1024,17 +1032,6 @@
+                         return Err(error);
+                     }
+ 
+-                    // Custom QoS values are not fully described by PACS, so a
+-                    // device can reject them only after Config QoS/Create CIS.
+-                    // Give a transient radio miss one clean retry, but never
+-                    // turn a user-entered combination into a fifteen-minute (or
+-                    // unlimited) loop that repeatedly wakes the headset.
+-                    let custom = Settings::load(&settings_path()).get("preset") == Some("custom");
+-                    if custom && attempt >= 2 {
+-                        log("the custom stream failed twice; automatic retries are paused until its settings change");
+-                        return Err(error);
+-                    }
+-
+                     // The very first attempt gets one immediate retry and then
+                     // reports. Two clean attempts cost about a second between
+                     // them and cover the common case of the peer still tidying
+@@ -1366,40 +1363,23 @@
+             .map(|bond| bond.long_term_key)
+             .filter(|key| key.iter().any(|&byte| byte != 0));
+ 
+-        // Set when the saved key turned out to be dead, so it can be forgotten
+-        // once the borrow of the session is over.
+-        let mut stale_bond = false;
+         let key_result = if let Some(key) = stored_key {
+             match session.resume_encryption(handle, &key) {
+                 Ok(()) => {
+                     log("restored an encrypted connection from the saved bond");
+                     Ok(key)
+                 }
+-                Err(error) => {
+-                    // The saved key is no longer the one the headphones hold.
+-                    // That happens whenever they are paired to something else in
+-                    // the meantime, or reset - it is ordinary, not damage - and
+-                    // the only way out of it is a fresh key exchange. Telling
+-                    // the user to unpair by hand was asking them to perform the
+-                    // recovery the stack can perform itself, and until they did
+-                    // every reconnect failed identically.
+-                    log(format!(
+-                        "the saved key was refused ({error}); pairing again from scratch"
+-                    ));
+-                    stale_bond = true;
+-                    session
+-                        .pair(&mut link, handle, device)
++                Err(error) if saved_key_rejected(&error) => {
++                    log(format!("saved key rejected ({error}); attempting fresh pairing"));
++                    session.pair(&mut link, handle, device)
+                         .map_err(|e| format!("pairing again failed: {e}"))
+                 }
++                Err(error) => Err(format!("encryption could not be restored: {error}")),
+             }
+         } else {
+             session.pair(&mut link, handle, device)
+                 .map_err(|e| format!("pairing failed: {e}"))
+         };
+-        if stale_bond {
+-            self.bonds.remove(address);
+-            let _ = self.bonds.save(&BondStore::default_path());
+-        }
+ 
+         let long_term_key = match key_result {
+             Ok(key) => key,
+@@ -2771,3 +2751,29 @@
+         assert!(apply_setting_change(&mut settings, "not_a_setting", "1").is_err());
+     }
+ }
++
++#[cfg(test)]
++mod audit_regression_tests {
++    use super::*;
++    #[test]
++    fn transient_encryption_errors_never_invalidate_a_bond() {
++        use olea_core::controller::ControllerError;
++        use olea_core::session::SessionError;
++        for status in [0x05, 0x06] {
++            assert!(saved_key_rejected(&SessionError::Controller(ControllerError::EncryptionRejected { status })));
++        }
++        for status in [0x08, 0x0c, 0x1f] {
++            assert!(!saved_key_rejected(&SessionError::Controller(ControllerError::EncryptionRejected { status })));
++        }
++        assert!(!saved_key_rejected(&SessionError::Controller(ControllerError::EventTimeout)));
++        assert!(!saved_key_rejected(&SessionError::EncryptionFailed));
++        assert!(!saved_key_rejected(&SessionError::Transport(olea_core::transport::TransportError::Usb("unplugged".into()))));
++    }
++
++    #[test]
++    fn radio_loss_is_retryable_but_invalid_custom_codec_is_not() {
++        assert!(!deterministic_configuration_error("connection failed: connection attempt did not complete"));
++        assert!(deterministic_configuration_error("device rejected the custom configuration: unsupported rate"));
++    }
++
++}

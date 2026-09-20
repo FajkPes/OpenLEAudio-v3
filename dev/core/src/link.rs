@@ -1,0 +1,1284 @@
+//! GATT over an established LE connection.
+//!
+//! Events arrive on interrupt IN and ACL data on bulk IN. Both reads block, so
+//! each gets its own thread feeding one channel. Everything above this point
+//! sees a single ordered stream and can wait with a timeout instead of hanging
+//! forever on a device that stopped answering.
+
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+use crate::att::{self, att_op, cid, AclReassembler, AttError, Characteristic, ServiceRange};
+use crate::bap::PacRecord;
+use crate::hci::Event;
+use crate::transport::UsbTransport;
+
+/// How long any single ATT exchange may take before we give up on it.
+pub const ATT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Handles reserved by the SIG for PACS and ASCS characteristics.
+/// Battery Service, as assigned by the Bluetooth SIG.
+pub mod battery_uuid {
+    pub const SERVICE: u16 = 0x180F;
+    pub const LEVEL: u16 = 0x2A19;
+}
+
+/// Where one battery lives on the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatteryHandles {
+    pub level: u16,
+    pub level_cccd: u16,
+    /// Whether the device will tell us when the level changes, or whether it
+    /// has to be asked. Asking costs a round trip and some airtime, so it is
+    /// worth knowing which of the two this is.
+    pub notifies: bool,
+}
+
+/// Splits an Audio Contexts value into its sink and source halves.
+///
+/// Both Available and Supported Audio Contexts use the same layout: a 16-bit
+/// context bitmap for streams towards the device, then one for streams from it.
+pub fn parse_context_pair(value: &[u8]) -> (Option<u16>, Option<u16>) {
+    let sink = (value.len() >= 2).then(|| u16::from_le_bytes([value[0], value[1]]));
+    let source = (value.len() >= 4).then(|| u16::from_le_bytes([value[2], value[3]]));
+    (sink, source)
+}
+
+/// A Battery Level value: one byte, 0 to 100 per cent.
+///
+/// Values above 100 are rejected rather than clamped. A device sending 255 is
+/// not reporting a very full battery, it is reporting that it does not know,
+/// and showing that as full is worse than showing nothing.
+pub fn parse_battery_level(value: &[u8]) -> Option<u8> {
+    match value {
+        [percent, ..] if *percent <= 100 => Some(*percent),
+        _ => None,
+    }
+}
+
+pub mod pacs_uuid {
+    pub const SINK_PAC: u16 = 0x2BC9;
+    pub const SINK_AUDIO_LOCATIONS: u16 = 0x2BCA;
+    pub const SOURCE_PAC: u16 = 0x2BCB;
+    pub const AVAILABLE_CONTEXTS: u16 = 0x2BCD;
+    pub const SUPPORTED_CONTEXTS: u16 = 0x2BCE;
+
+    pub const SINK_ASE: u16 = 0x2BC4;
+    pub const SOURCE_ASE: u16 = 0x2BC5;
+    pub const ASE_CONTROL_POINT: u16 = 0x2BC6;
+
+    pub const SERVICE_PACS: u16 = 0x1850;
+    pub const SERVICE_ASCS: u16 = 0x184E;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LinkError {
+    #[error("ASCS rejected: {0}")]
+    AscsRejected(String),
+    #[error(transparent)]
+    Att(#[from] AttError),
+
+    #[error("no response within {0:?}")]
+    Timeout(Duration),
+
+    #[error("link closed")]
+    Closed,
+
+    #[error("transport error: {0}")]
+    Transport(String),
+
+    #[error("service {0:#06x} not found on this device")]
+    ServiceMissing(u16),
+
+    #[error("characteristic {0:#06x} not found")]
+    CharacteristicMissing(u16),
+
+    #[error(transparent)]
+    Unsafe(#[from] crate::safety::SafetyViolation),
+
+    #[error("protejsek spojeni ukoncil: {} (kod {reason:#04x})", crate::hci::disconnect_reason(*reason))]
+    Disconnected { reason: u8 },
+}
+
+type Result<T> = std::result::Result<T, LinkError>;
+
+/// Reader threads turning two blocking pipes into two queues.
+///
+/// Events and ACL data are kept apart on purpose. When they shared one channel,
+/// whichever layer happened to be waiting consumed whatever arrived - so an SMP
+/// response could be pulled out by the command loop, which discards ACL, and
+/// then waited for forever by the layer that actually wanted it.
+///
+/// There must be exactly one pump per adapter. Two pumps means two threads
+/// blocked on the same endpoint, and each incoming packet goes to whichever wins
+/// the race, which loses roughly half of them.
+pub struct HciPump {
+    events: Receiver<Event>,
+    acl: Receiver<Vec<u8>>,
+    /// Events looked at by one layer and handed back for another to consume.
+    /// Peeking for a dropped link must not destroy what a later step awaits.
+    held: RefCell<VecDeque<Event>>,
+    /// False once a reader thread has given up.
+    ///
+    /// Nothing above this could previously tell. A dead event reader is silent
+    /// in the worst way: no events arrive, so no disconnection is ever noticed,
+    /// the audio loop keeps encoding into a link that may not exist, and the
+    /// only visible trace is a delivered counter that stopped moving while the
+    /// frame counter did not. Hours of that, with nothing in the log.
+    alive: Arc<AtomicBool>,
+    stopped: Arc<AtomicBool>,
+    readers: RefCell<Vec<thread::JoinHandle<()>>>,
+    transport: UsbTransport,
+}
+
+impl Drop for HciPump {
+    fn drop(&mut self) { self.stop(); }
+}
+
+impl HciPump {
+    /// Starts reading. The threads end on their own when the device goes away,
+    /// because the blocking read then fails rather than blocking forever.
+    pub fn start(transport: UsbTransport) -> Self {
+        // How many reads in a row have to fail before the adapter counts as
+        // gone. A single failure never did: a pipe can stall, a transfer can be
+        // aborted, a read can time out under load, and treating any of those as
+        // "the device has been unplugged" ends the thread for good. At ten
+        // milliseconds apart this is about two seconds of nothing but failures,
+        // which no working adapter produces and no unplugged one survives.
+        const GIVE_UP_AFTER: u32 = 200;
+        const BETWEEN_TRIES: Duration = Duration::from_millis(10);
+
+        let (event_sender, events) = mpsc::channel();
+        let (acl_sender, acl) = mpsc::channel();
+        let alive = Arc::new(AtomicBool::new(true));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let event_stopped = stopped.clone();
+        let acl_stopped = stopped.clone();
+
+        let event_transport = transport.clone();
+        let event_alive = alive.clone();
+        let event_reader = thread::spawn(move || {
+            let endpoint = event_transport.event_endpoint();
+            let mut failures = 0u32;
+            while !event_stopped.load(Ordering::Acquire) && event_alive.load(Ordering::Relaxed) {
+                match event_transport.read_event() {
+                    Ok(raw) => {
+                        failures = 0;
+                        match Event::parse(&raw) {
+                            Some(event) => {
+                                if let Some(reply) = crate::hci::remote_parameter_reply(&event) {
+                                    if let Err(error) = event_transport.queue_command(reply) {
+                                        crate::trace::note(&format!("remote parameter reply could not be queued: {error}"));
+                                    }
+                                }
+                                if let Some(summary) = crate::hci::link_update_summary(&event) {
+                                    crate::trace::note(&summary);
+                                }
+                                if event_sender.send(event).is_err() {
+                                    break; // receiver dropped: an orderly end
+                                }
+                            }
+                            None => continue, // malformed event, keep going
+                        }
+                    }
+                    Err(crate::transport::TransportError::DeviceGone) => break,
+                    Err(crate::transport::TransportError::ReadTimeout) => { failures = 0; }
+                    Err(_) => {
+                        if event_stopped.load(Ordering::Acquire) { break; }
+                        failures += 1;
+                        if failures >= GIVE_UP_AFTER {
+                            break;
+                        }
+                        // A stalled pipe stays stalled until it is cleared, so
+                        // retrying without this retries something that cannot
+                        // work.
+                        event_transport.recover_pipe(endpoint);
+                        thread::sleep(BETWEEN_TRIES);
+                    }
+                }
+            }
+            event_alive.store(false, Ordering::Relaxed);
+        });
+
+        let acl_transport = transport.clone();
+        let acl_alive = alive.clone();
+        let acl_reader = thread::spawn(move || {
+            let endpoint = acl_transport.acl_in_endpoint();
+            let mut failures = 0u32;
+            while !acl_stopped.load(Ordering::Acquire) && acl_alive.load(Ordering::Relaxed) {
+                match acl_transport.read_acl() {
+                    Ok(packet) => {
+                        failures = 0;
+                        if acl_sender.send(packet).is_err() {
+                            break;
+                        }
+                    }
+                    Err(crate::transport::TransportError::DeviceGone) => break,
+                    Err(crate::transport::TransportError::ReadTimeout) => { failures = 0; }
+                    Err(_) => {
+                        if acl_stopped.load(Ordering::Acquire) { break; }
+                        failures += 1;
+                        if failures >= GIVE_UP_AFTER {
+                            break;
+                        }
+                        acl_transport.recover_pipe(endpoint);
+                        thread::sleep(BETWEEN_TRIES);
+                    }
+                }
+            }
+            acl_alive.store(false, Ordering::Relaxed);
+        });
+
+        Self {
+            events,
+            acl,
+            held: RefCell::new(VecDeque::new()),
+            alive,
+            stopped,
+            readers: RefCell::new(vec![event_reader, acl_reader]),
+            transport,
+        }
+    }
+
+    /// Stop before aborting. A read racing the abort is bounded by the IN pipe
+    /// timeout, and cannot resubmit after cancellation. Join before reopening.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        self.alive.store(false, Ordering::Relaxed);
+        self.transport.abort_reads();
+        for reader in self.readers.borrow_mut().drain(..) {
+            let _ = reader.join();
+        }
+    }
+
+    /// Whether both readers are still running.
+    ///
+    /// Anything that loops for a long time has to ask. A reader that has given
+    /// up cannot report a disconnection, so from above it looks exactly like a
+    /// connection with nothing happening on it.
+    pub fn alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Next HCI event. Never consumes ACL data.
+    pub fn recv_event(&self, timeout: Duration) -> Result<Event> {
+        if let Some(event) = self.held.borrow_mut().pop_front() {
+            return Ok(event);
+        }
+        Self::take(self.events.recv_timeout(timeout), timeout)
+    }
+
+    /// An event if one is already waiting, without blocking.
+    pub fn try_recv_event(&self) -> Option<Event> {
+        if let Some(event) = self.held.borrow_mut().pop_front() {
+            return Some(event);
+        }
+        self.events.try_recv().ok()
+    }
+
+    /// Returns events to the queue for whoever actually wants them.
+    ///
+    /// They go to the front, in order, so a caller that looked at the queue and
+    /// handed it back leaves it exactly as it found it. Returning them one at a
+    /// time from inside a drain loop would be an infinite loop: `try_recv_event`
+    /// reads this same queue, so each event would be pulled straight back out.
+    pub fn put_back_events(&self, events: Vec<Event>) {
+        let mut held = self.held.borrow_mut();
+        for event in events.into_iter().rev() {
+            held.push_front(event);
+        }
+    }
+
+    /// Next ACL packet. Never consumes events.
+    pub fn recv_acl(&self, timeout: Duration) -> Result<Vec<u8>> {
+        Self::take(self.acl.recv_timeout(timeout), timeout)
+    }
+
+    fn take<T>(
+        result: std::result::Result<T, RecvTimeoutError>,
+        timeout: Duration,
+    ) -> Result<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(RecvTimeoutError::Timeout) => Err(LinkError::Timeout(timeout)),
+            Err(RecvTimeoutError::Disconnected) => Err(LinkError::Closed),
+        }
+    }
+}
+
+/// A discovered service with its characteristics.
+#[derive(Debug, Clone)]
+pub struct DiscoveredService {
+    pub range: ServiceRange,
+    pub characteristics: Vec<Characteristic>,
+}
+
+impl DiscoveredService {
+    pub fn characteristic(&self, uuid: u16) -> Option<&Characteristic> {
+        self.characteristics
+            .iter()
+            .find(|c| c.uuid.as_short() == Some(uuid))
+    }
+}
+
+/// Everything read out of a device's PACS.
+#[derive(Debug, Clone, Default)]
+pub struct AudioCapabilities {
+    pub sink_records: Vec<PacRecord>,
+    pub source_records: Vec<PacRecord>,
+    pub sink_locations: Option<u32>,
+    /// Contexts the device can accept *right now*, for streams towards it.
+    ///
+    /// The specification calls this Available Audio Contexts, and it is the one
+    /// standard, vendor-neutral way to tell that a headset is already busy with
+    /// another host: a device holding a second connection publishes fewer
+    /// available contexts than it supports. Nothing else in BAP reports
+    /// multipoint, and every vendor's own protocol says it differently.
+    pub available_contexts: Option<u16>,
+    /// The same, for streams coming from the device - its microphone.
+    pub available_source_contexts: Option<u16>,
+    pub supported_contexts: Option<u16>,
+    pub supported_source_contexts: Option<u16>,
+    /// Where Available Audio Contexts lives, so changes can be subscribed to.
+    pub available_contexts_handle: Option<u16>,
+    pub sink_ase_ids: Vec<u8>,
+    pub source_ase_ids: Vec<u8>,
+}
+
+/// Where volume lives on a device that has a Volume Control Service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeControlHandles {
+    pub state: u16,
+    pub state_cccd: u16,
+    pub control_point: u16,
+}
+
+/// A GATT client bound to one connection handle.
+pub struct Link {
+    disconnected_reason: std::cell::Cell<Option<u8>>,
+    transport: UsbTransport,
+    pump: Rc<HciPump>,
+    handle: u16,
+    reassembler: AclReassembler,
+    mtu: u16,
+    max_acl_payload: usize,
+    write_policy: crate::safety::WritePolicy,
+    /// Unsolicited values the device sent, in arrival order.
+    notifications: Vec<(u16, Vec<u8>)>,
+    ascs_control_point: Option<u16>,
+    ascs_opcode: Option<u8>,
+    att_timeout: Duration,
+    /// The GATT database does not change during one ACL connection. Rewalking
+    /// it for PACS, ASCS, volume, battery and teardown cost several identical
+    /// ATT round trips on every connect and made later operations race more
+    /// control traffic for no new information.
+    services_cache: Option<Vec<ServiceRange>>,
+    characteristics_cache: Vec<(u16, u16, Vec<Characteristic>)>,
+    /// ASE value handles learned during discovery. Teardown can then read the
+    /// state directly instead of discovering ASCS all over again.
+    ase_value_handles: Vec<(u8, u16)>,
+}
+
+impl Link {
+    pub fn new(transport: UsbTransport, pump: Rc<HciPump>, handle: u16) -> Self {
+        Self {
+            disconnected_reason: std::cell::Cell::new(None),
+            transport,
+            pump,
+            handle,
+            reassembler: AclReassembler::new(),
+            mtu: att::ATT_DEFAULT_MTU,
+            max_acl_payload: 27,
+            write_policy: crate::safety::WritePolicy::default(),
+            notifications: Vec::new(),
+            ascs_control_point: None,
+            ascs_opcode: None,
+            att_timeout: ATT_TIMEOUT,
+            services_cache: None,
+            characteristics_cache: Vec::new(),
+            ase_value_handles: Vec::new(),
+        }
+    }
+
+    pub fn mtu(&self) -> u16 {
+        self.mtu
+    }
+
+    /// A teardown read may consume the disconnect before the session sees it.
+    pub fn disconnected_reason(&self) -> Option<u8> {
+        self.disconnected_reason.get()
+    }
+
+    /// Sends one ATT PDU and waits for the matching response.
+    ///
+    /// Events and traffic on other channels are skipped rather than treated as
+    /// answers, so a notification arriving mid-request does not derail the read.
+    fn request(&mut self, pdu: &[u8]) -> Result<Vec<u8>> {
+        for packet in att::build_acl_packets(self.handle, cid::ATT, pdu, self.max_acl_payload) {
+            self.transport
+                .send_acl(&packet)
+                .map_err(|e| LinkError::Transport(e.to_string()))?;
+        }
+
+        let budget = self.att_timeout;
+        let deadline = std::time::Instant::now() + budget;
+
+        loop {
+            let raw = self.recv_acl_watching_link(deadline, budget)?;
+
+            let frame = match self.reassembler.push(&raw) {
+                Ok(Some(frame)) => frame,
+                Ok(None) => continue,
+                Err(_) => continue, // damaged fragment, wait for the next one
+            };
+
+            if frame.cid != cid::ATT {
+                Self::answer_signalling(&self.transport, self.handle, self.max_acl_payload, &frame);
+                continue;
+            }
+
+            // Notifications are unsolicited; they are not the response we asked
+            // for - but they are the device's own answer to what we last wrote,
+            // so they are kept rather than dropped. Discarding them is how a
+            // rejected configuration comes to look exactly like an accepted one.
+            match frame.payload.first() {
+                Some(&att_op::HANDLE_VALUE_NOTIFICATION) | Some(&att_op::HANDLE_VALUE_INDICATION) => {
+                    if let &[_, lo, hi, ref value @ ..] = frame.payload.as_slice() {
+                        self.notifications
+                            .push((u16::from_le_bytes([lo, hi]), value.to_vec()));
+                    }
+                    // An indication, unlike a notification, owns the ATT bearer
+                    // until it is confirmed. Without this one-byte answer some
+                    // headsets stop replying to the request that follows it.
+                    if frame.payload.first() == Some(&att_op::HANDLE_VALUE_INDICATION) {
+                        self.send_att_without_wait(&[att_op::HANDLE_VALUE_CONFIRMATION])?;
+                    }
+                    continue;
+                }
+                Some(&att_op::EXCHANGE_MTU_REQUEST) if frame.payload.len() >= 3 => {
+                    // A peripheral may initiate MTU exchange immediately after
+                    // bonded encryption comes back. It can cross our request on
+                    // the wire; treating it as our response produced the exact
+                    // "malformed MTU response" failure seen on the JBL headset.
+                    let peer = u16::from_le_bytes([frame.payload[1], frame.payload[2]]);
+                    self.mtu = att::ATT_PREFERRED_MTU.min(peer).max(att::ATT_DEFAULT_MTU);
+                    self.send_att_without_wait(&att::exchange_mtu_response(att::ATT_PREFERRED_MTU))?;
+                    continue;
+                }
+                _ => {
+                    // The peripheral may be a GATT client at the same time. JBL
+                    // probes the optional host Database Hash (0x2B2A) while our
+                    // primary-service discovery is outstanding. Answer its
+                    // request, then keep waiting for the response to ours.
+                    if crate::media::serve(&self.transport, self.handle, Some(&frame.payload), self.mtu as usize)
+                        .map_err(|e| LinkError::Transport(e.to_string()))? { continue; }
+                    return Ok(frame.payload);
+                }
+            }
+        }
+    }
+
+    fn send_att_without_wait(&self, pdu: &[u8]) -> Result<()> {
+        for packet in att::build_acl_packets(self.handle, cid::ATT, pdu, self.max_acl_payload) {
+            self.transport
+                .send_acl(&packet)
+                .map_err(|e| LinkError::Transport(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+
+    /// Answers an LE signalling request, if this frame is one.
+    ///
+    /// Called from every path that pulls ACL frames apart, because the request
+    /// arrives unprompted and the peer starts a one-minute timer the moment it
+    /// sends it. Silence there costs the whole connection, so this is never
+    /// something to leave for a later step.
+    pub fn answer_signalling(
+        transport: &UsbTransport,
+        handle: u16,
+        max_acl_payload: usize,
+        frame: &att::L2capFrame,
+    ) -> Option<crate::l2cap::ConnectionParameters> {
+        if frame.cid != cid::LE_SIGNALING {
+            return None;
+        }
+
+        let crate::l2cap::Signal::ParameterUpdateRequest { identifier, parameters } =
+            crate::l2cap::parse(&frame.payload)?;
+
+        let accepted = parameters.valid();
+        let (low, high) = parameters.interval_ms();
+        crate::trace::note(&format!(
+            "peer connection parameters: {low:.1}-{high:.1} ms, latency {}, timeout {} ms; valid={accepted}",
+            parameters.latency,
+            parameters.supervision_timeout as u32 * 10
+        ));
+
+        let pdu = crate::l2cap::parameter_update_response(identifier,
+            if accepted { crate::l2cap::RESULT_ACCEPTED } else { crate::l2cap::RESULT_REJECTED });
+        for packet in att::build_acl_packets(handle, cid::LE_SIGNALING, &pdu, max_acl_payload) {
+            if let Err(error) = transport.send_acl(&packet) {
+                crate::trace::note(&format!("connection parameter response failed: {error}"));
+                return None;
+            }
+        }
+        if !accepted { return None; }
+        let update = crate::hci::le_connection_update(handle, parameters.interval_min,
+            parameters.interval_max, parameters.latency, parameters.supervision_timeout);
+        if let Err(error) = transport.queue_command(update) {
+            crate::trace::note(&format!("connection parameter update could not be submitted: {error}"));
+            return None;
+        }
+        Some(parameters)
+    }
+
+    /// Waits for one ACL packet, giving up early if the link goes away.
+    ///
+    /// A dropped connection is otherwise indistinguishable from a peer that is
+    /// merely slow: the stack sits out the whole timeout and then reports
+    /// silence, pointing the investigation at the peer instead of the link.
+    /// Events that are not about this handle are handed straight back, because
+    /// later steps are waiting for them.
+    fn recv_acl_watching_link(&self, deadline: std::time::Instant, budget: Duration) -> Result<Vec<u8>> {
+        const POLL: Duration = Duration::from_millis(100);
+
+        if let Some(reason) = self.disconnected_reason.get() {
+            return Err(LinkError::Disconnected { reason });
+        }
+
+        loop {
+            // Drain into a local list first, then hand the whole lot back. The
+            // queue must not be written while it is being read, or the same
+            // event is served forever and no ACL is ever collected.
+            let mut inspected = Vec::new();
+            let mut dropped = None;
+
+            while let Some(event) = self.pump.try_recv_event() {
+                if let Some((handle, reason)) = crate::hci::parse_disconnection_complete(&event) {
+                    if handle == self.handle {
+                        dropped = Some(reason);
+                        break;
+                    }
+                }
+                inspected.push(event);
+            }
+            self.pump.put_back_events(inspected);
+
+            if let Some(reason) = dropped {
+                self.disconnected_reason.set(Some(reason));
+                return Err(LinkError::Disconnected { reason });
+            }
+
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(LinkError::Timeout(budget));
+            }
+
+            match self.pump.recv_acl(remaining.min(POLL)) {
+                Ok(raw) => return Ok(raw),
+                Err(LinkError::Timeout(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Sends one SMP PDU and waits for the peer's next SMP PDU.
+    ///
+    /// Pairing runs on L2CAP channel 6, separate from ATT. Traffic on other
+    /// channels is skipped rather than misread as a pairing response.
+    pub fn smp_exchange(&mut self, pdu: &[u8], timeout: Duration) -> Result<Vec<u8>> {
+        for packet in att::build_acl_packets(self.handle, cid::SMP, pdu, self.max_acl_payload) {
+            self.transport
+                .send_acl(&packet)
+                .map_err(|e| LinkError::Transport(e.to_string()))?;
+        }
+
+        self.smp_receive(timeout)
+    }
+
+    /// Waits for an SMP PDU without sending anything first.
+    ///
+    /// Needed because the peripheral sends its confirm value unprompted, between
+    /// two of our messages.
+    pub fn smp_receive(&mut self, timeout: Duration) -> Result<Vec<u8>> {
+        let deadline = std::time::Instant::now() + timeout;
+
+        loop {
+            let raw = self.recv_acl_watching_link(deadline, timeout)?;
+
+            match self.reassembler.push(&raw) {
+                Ok(Some(frame)) if frame.cid == cid::SMP => return Ok(frame.payload),
+                Ok(Some(frame)) => {
+                    Self::answer_signalling(&self.transport, self.handle, self.max_acl_payload, &frame);
+                    continue;
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    /// Negotiates the largest PDU both sides accept, so PAC records arrive whole.
+    pub fn exchange_mtu(&mut self) -> Result<u16> {
+        let response = self.request(&att::exchange_mtu_request(att::ATT_PREFERRED_MTU))?;
+        self.mtu = att::parse_mtu_response(&response, att::ATT_PREFERRED_MTU)?;
+        Ok(self.mtu)
+    }
+
+    /// Walks the whole primary service table.
+    pub fn discover_services(&mut self) -> Result<Vec<ServiceRange>> {
+        if let Some(services) = &self.services_cache {
+            return Ok(services.clone());
+        }
+
+        let mut services = Vec::new();
+        let mut start = 0x0001u16;
+
+        loop {
+            let request =
+                att::read_by_group_type_request(start, 0xFFFF, att::gatt_uuid::PRIMARY_SERVICE);
+
+            let response = match self.request(&request) {
+                Ok(response) => response,
+                // "attribute not found" is how the server says it is done.
+                Err(LinkError::Att(AttError::Protocol { code: 0x0A, .. })) => break,
+                Err(e) => return Err(e),
+            };
+
+            let batch = match att::parse_service_ranges(&response) {
+                Ok(batch) => batch,
+                Err(AttError::Protocol { code: 0x0A, .. }) => break,
+                Err(e) => return Err(e.into()),
+            };
+
+            if batch.is_empty() {
+                break;
+            }
+
+            let last_end = batch.last().map(|s| s.end_handle).unwrap_or(0xFFFF);
+            services.extend(batch);
+
+            if last_end >= 0xFFFF {
+                break;
+            }
+            start = last_end + 1;
+        }
+
+        self.services_cache = Some(services.clone());
+        Ok(services)
+    }
+
+    /// Lists the characteristics inside one service.
+    pub fn discover_characteristics(&mut self, range: &ServiceRange) -> Result<Vec<Characteristic>> {
+        if let Some((_, _, characteristics)) = self
+            .characteristics_cache
+            .iter()
+            .find(|(start, end, _)| *start == range.start_handle && *end == range.end_handle)
+        {
+            return Ok(characteristics.clone());
+        }
+
+        let mut characteristics = Vec::new();
+        let mut start = range.start_handle;
+
+        while start <= range.end_handle {
+            let request =
+                att::read_by_type_request(start, range.end_handle, att::gatt_uuid::CHARACTERISTIC);
+
+            let response = match self.request(&request) {
+                Ok(response) => response,
+                Err(LinkError::Att(AttError::Protocol { code: 0x0A, .. })) => break,
+                Err(e) => return Err(e),
+            };
+
+            let batch = match att::parse_characteristics(&response) {
+                Ok(batch) => batch,
+                Err(AttError::Protocol { code: 0x0A, .. }) => break,
+                Err(e) => return Err(e.into()),
+            };
+
+            if batch.is_empty() {
+                break;
+            }
+
+            let last = batch.last().map(|c| c.declaration_handle).unwrap_or(0xFFFF);
+            characteristics.extend(batch);
+
+            if last >= range.end_handle {
+                break;
+            }
+            start = last + 1;
+        }
+
+        self.characteristics_cache.push((
+            range.start_handle,
+            range.end_handle,
+            characteristics.clone(),
+        ));
+        Ok(characteristics)
+    }
+
+    /// Reads a characteristic, continuing with Read Blob when the value is long.
+    pub fn read_characteristic(&mut self, value_handle: u16) -> Result<Vec<u8>> {
+        let response = self.request(&att::read_request(value_handle))?;
+        let mut value = att::parse_read_response(&response)?;
+
+        // A response that exactly fills the MTU may have been truncated.
+        while value.len() == (self.mtu - 1) as usize {
+            let offset = value.len() as u16;
+            let response = match self.request(&att::read_blob_request(value_handle, offset)) {
+                Ok(response) => response,
+                // Reading past the end is how the server signals completion.
+                Err(LinkError::Att(AttError::Protocol { code: 0x07, .. })) => break,
+                Err(e) => return Err(e),
+            };
+
+            let chunk = att::parse_read_response(&response)?;
+            if chunk.is_empty() {
+                break;
+            }
+            value.extend_from_slice(&chunk);
+        }
+
+        Ok(value)
+    }
+
+    /// Records which handle the stack may write to, learned from discovery.
+    pub fn allow_writes_to(&mut self, handle: u16) {
+        self.write_policy.allow_ase_control_point(handle);
+    }
+
+    /// Writes to a characteristic, refusing any handle discovery did not approve.
+    ///
+    /// The check lives here rather than at the call site so no caller can reach
+    /// the device without passing it. Writing to a guessed handle is how you
+    /// change a setting on someone's headphones that was never meant to be touched.
+    pub fn write_characteristic(&mut self, value_handle: u16, value: &[u8]) -> Result<()> {
+        self.write_policy
+            .check_write(value_handle, value)
+            .map_err(LinkError::Unsafe)?;
+
+        let response = self.request(&att::write_request(value_handle, value))?;
+        att::check_error(&response)?;
+        Ok(())
+    }
+
+    /// Full discovery plus a read of everything PACS and ASCS expose.
+    ///
+    /// This is the call that finally answers what the headphones can actually do,
+    /// which the Windows GATT client refuses to tell us.
+    /// Shortens how long a request waits, for teardown.
+    ///
+    /// A peer that is going away, or has stopped answering after a failed
+    /// channel, will never reply - and waiting the full timeout for each of
+    /// several writes is why disconnecting looked like the program had hung.
+    /// Discover the control point's actual CCCD instead of assuming value + 1.
+    pub fn subscribe_ascs_responses(&mut self, control:u16) -> Result<()> {
+        let service=self.discover_services()?.into_iter().find(|s|s.uuid.as_short()==Some(pacs_uuid::SERVICE_ASCS))
+            .ok_or(LinkError::ServiceMissing(pacs_uuid::SERVICE_ASCS))?;
+        let characteristics=self.discover_characteristics(&service)?;
+        let end=characteristics.iter().filter(|c|c.declaration_handle>control).map(|c|c.declaration_handle-1).min().unwrap_or(service.end_handle);
+        let mut start=control.checked_add(1).ok_or(LinkError::CharacteristicMissing(0x2902))?;
+        while start<=end {
+            let mut request=vec![att_op::FIND_INFORMATION_REQUEST];request.extend(start.to_le_bytes());request.extend(end.to_le_bytes());
+            let response=self.request(&request)?;
+            if response.first()!=Some(&att_op::FIND_INFORMATION_RESPONSE) || response.len()<2 {break;}
+            let width=match response[1] {1=>4,2=>18,_=>break};
+            let mut last=None;
+            for row in response[2..].chunks_exact(width) {
+                let handle=u16::from_le_bytes([row[0],row[1]]);last=Some(handle);
+                if width==4 && row[2..]==[0x02,0x29] {
+                    self.subscribe(handle)?;self.ascs_control_point=Some(control);return Ok(());
+                }
+            }
+            match last.and_then(|h|h.checked_add(1)).filter(|h|*h>start) {Some(h)=>start=h,None=>break}
+        }
+        Err(LinkError::CharacteristicMissing(0x2902))
+    }
+    pub fn begin_ascs_operation(&mut self, opcode:u8) {self.ascs_opcode=Some(opcode);self.notifications.retain(|(h,_)|Some(*h)!=self.ascs_control_point);}
+    pub fn check_ascs_errors(&mut self)->Result<()> {
+        let mut error=None;
+        self.notifications.retain(|(handle,value)| {
+            if Some(*handle)!=self.ascs_control_point {return true;}
+            if value.first().copied()!=self.ascs_opcode {return false;}
+            if let Some((opcode,responses))=crate::bap::ase::parse_control_point_response(value) {
+                for r in responses {if !r.accepted() {error=Some(format!("operation {opcode:#04x}, ASE {}: {} (response {:#04x}, reason {:#04x})",r.ase_id,r.explain(),r.response_code,r.reason));break;}}
+            }
+            false
+        });
+        if let Some(error)=error {Err(LinkError::AscsRejected(error))}else{Ok(())}
+    }
+
+    pub fn set_att_timeout(&mut self, timeout: Duration) {
+        self.att_timeout = timeout;
+    }
+
+    /// Everything the device has notified since this was last called.
+    pub fn take_notifications(&mut self) -> Vec<(u16, Vec<u8>)> {
+        std::mem::take(&mut self.notifications)
+    }
+
+    /// Waits a moment for notifications to arrive, then hands them over.
+    ///
+    /// The device answers a control point write **after** the write response, so
+    /// asking immediately would always come back empty.
+    pub fn collect_notifications(&mut self, wait: Duration) -> Vec<(u16, Vec<u8>)> {
+        let deadline = std::time::Instant::now() + wait;
+
+        while std::time::Instant::now() < deadline {
+            let Ok(raw) = self.pump.recv_acl(Duration::from_millis(50)) else {
+                continue;
+            };
+
+            if let Ok(Some(frame)) = self.reassembler.push(&raw) {
+                if frame.cid == cid::ATT && crate::media::serve(&self.transport, self.handle,
+                    Some(&frame.payload), self.mtu as usize).unwrap_or(false) { continue; }
+                if Self::answer_signalling(&self.transport, self.handle, self.max_acl_payload, &frame)
+                    .is_some()
+                {
+                    continue;
+                }
+
+                if let &[op, lo, hi, ref value @ ..] = frame.payload.as_slice() {
+                    if frame.cid == cid::ATT
+                        && (op == att_op::HANDLE_VALUE_NOTIFICATION
+                            || op == att_op::HANDLE_VALUE_INDICATION)
+                    {
+                        self.notifications
+                            .push((u16::from_le_bytes([lo, hi]), value.to_vec()));
+                        if op == att_op::HANDLE_VALUE_INDICATION {
+                            let _ = self.send_att_without_wait(&[att_op::HANDLE_VALUE_CONFIRMATION]);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.take_notifications()
+    }
+
+    /// Finds each Sink ASE, without subscribing to anything.
+    ///
+    /// Reading is the quiet way to ask. Subscribing puts a notification on the
+    /// air for every state change, and those arriving during setup are what
+    /// stopped the second isochronous channel from coming up at all.
+    pub fn sink_ase_handles(&mut self) -> Result<Vec<(u8, u16)>> {
+        self.ase_handles(pacs_uuid::SINK_ASE)
+    }
+
+    pub fn source_ase_handles(&mut self) -> Result<Vec<(u8, u16)>> {
+        self.ase_handles(pacs_uuid::SOURCE_ASE)
+    }
+
+    /// Reads the current state of selected Sink and Source ASEs.
+    ///
+    /// Teardown deliberately does not subscribe to every ASE for the lifetime
+    /// of the stream: those notifications add control traffic at the most
+    /// timing-sensitive point of CIS setup. A bounded read here gives Release
+    /// real confirmation instead of waiting for notifications that were never
+    /// enabled.
+    pub fn ase_states(&mut self, wanted: &[u8]) -> Result<Vec<crate::bap::ase::AseState>> {
+        let mut states = Vec::new();
+        let mut handles: Vec<(u8, u16)> = self
+            .ase_value_handles
+            .iter()
+            .copied()
+            .filter(|(ase_id, _)| wanted.contains(ase_id))
+            .collect();
+
+        // A caller can reach teardown before the normal capability path filled
+        // the cache. Discover only in that exceptional case.
+        if !wanted.iter().all(|id| handles.iter().any(|(known, _)| known == id)) {
+            let services = self.discover_services()?;
+            let ascs = services
+                .iter()
+                .find(|s| s.uuid.as_short() == Some(pacs_uuid::SERVICE_ASCS))
+                .ok_or(LinkError::ServiceMissing(pacs_uuid::SERVICE_ASCS))?
+                .clone();
+
+            for characteristic in self.discover_characteristics(&ascs)? {
+                let uuid = characteristic.uuid.as_short();
+                if uuid != Some(pacs_uuid::SINK_ASE) && uuid != Some(pacs_uuid::SOURCE_ASE) {
+                    continue;
+                }
+                if let Ok(value) = self.read_characteristic(characteristic.value_handle) {
+                    if let Some(state) = crate::bap::ase::parse_state(&value) {
+                        if !self.ase_value_handles.iter().any(|(id, _)| *id == state.ase_id) {
+                            self.ase_value_handles.push((state.ase_id, characteristic.value_handle));
+                        }
+                    }
+                }
+            }
+            handles = self
+                .ase_value_handles
+                .iter()
+                .copied()
+                .filter(|(ase_id, _)| wanted.contains(ase_id))
+                .collect();
+        }
+
+        for (_, value_handle) in handles {
+            if let Ok(value) = self.read_characteristic(value_handle) {
+                if let Some(state) = crate::bap::ase::parse_state(&value) {
+                    if wanted.contains(&state.ase_id) {
+                        states.push(state);
+                    }
+                }
+            }
+        }
+        Ok(states)
+    }
+
+    fn ase_handles(&mut self, wanted_uuid: u16) -> Result<Vec<(u8, u16)>> {
+        let services = self.discover_services()?;
+
+        let ascs = services
+            .iter()
+            .find(|s| s.uuid.as_short() == Some(pacs_uuid::SERVICE_ASCS))
+            .ok_or(LinkError::ServiceMissing(pacs_uuid::SERVICE_ASCS))?
+            .clone();
+
+        let mut sinks = Vec::new();
+
+        for characteristic in self.discover_characteristics(&ascs)? {
+            if characteristic.uuid.as_short() != Some(wanted_uuid) {
+                continue;
+            }
+
+            if let Ok(value) = self.read_characteristic(characteristic.value_handle) {
+                if let Some(state) = crate::bap::ase::parse_state(&value) {
+                    if !self.ase_value_handles.iter().any(|(id, _)| *id == state.ase_id) {
+                        self.ase_value_handles.push((state.ase_id, characteristic.value_handle));
+                    }
+                    sinks.push((state.ase_id, characteristic.value_handle));
+                }
+            }
+        }
+
+        Ok(sinks)
+    }
+
+    /// Subscribes to every ASE the device exposes, plus the control point.
+    ///
+    /// Returns the value handle of each Sink ASE, so a later notification can be
+    /// tied back to the ASE it belongs to.
+    pub fn subscribe_to_ase_state(&mut self) -> Result<Vec<(u8, u16)>> {
+        let services = self.discover_services()?;
+
+        let ascs = services
+            .iter()
+            .find(|s| s.uuid.as_short() == Some(pacs_uuid::SERVICE_ASCS))
+            .ok_or(LinkError::ServiceMissing(pacs_uuid::SERVICE_ASCS))?
+            .clone();
+
+        let characteristics = self.discover_characteristics(&ascs)?;
+        let mut sinks = Vec::new();
+
+        for characteristic in characteristics {
+            let uuid = characteristic.uuid.as_short();
+            let is_ase = uuid == Some(pacs_uuid::SINK_ASE) || uuid == Some(pacs_uuid::SOURCE_ASE);
+            if !is_ase && uuid != Some(pacs_uuid::ASE_CONTROL_POINT) {
+                continue;
+            }
+
+            // The CCCD sits immediately after the value it configures.
+            let _ = self.subscribe(characteristic.value_handle + 1);
+
+            if uuid == Some(pacs_uuid::SINK_ASE) {
+                if let Ok(value) = self.read_characteristic(characteristic.value_handle) {
+                    if let Some(state) = crate::bap::ase::parse_state(&value) {
+                        sinks.push((state.ase_id, characteristic.value_handle));
+                    }
+                }
+            }
+        }
+
+        Ok(sinks)
+    }
+
+    /// Approves a descriptor for subscription and turns notifications on.
+    pub fn subscribe(&mut self, cccd_handle: u16) -> Result<()> {
+        self.write_policy.allow_subscription(cccd_handle);
+        self.write_characteristic(cccd_handle, &[0x01, 0x00])
+    }
+
+    /// Finds the Volume Control Service, if the device has one.
+    ///
+    /// Returns `Ok(None)` rather than an error when it is absent: plenty of LE
+    /// Audio devices carry no VCS, and that is a device without remote volume,
+    /// not a broken connection.
+    pub fn discover_volume_control(&mut self) -> Result<Option<VolumeControlHandles>> {
+        let services = self.discover_services()?;
+
+        let Some(range) = services
+            .iter()
+            .find(|s| s.uuid.as_short() == Some(crate::vcs::uuid::VOLUME_CONTROL_SERVICE))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+
+        let characteristics = self.discover_characteristics(&range)?;
+        let find = |uuid: u16| {
+            characteristics
+                .iter()
+                .find(|c| c.uuid.as_short() == Some(uuid))
+                .cloned()
+        };
+
+        let (Some(state), Some(control_point)) = (
+            find(crate::vcs::uuid::VOLUME_STATE),
+            find(crate::vcs::uuid::VOLUME_CONTROL_POINT),
+        ) else {
+            return Ok(None);
+        };
+
+        // The Client Characteristic Configuration descriptor sits immediately
+        // after the value it configures. Discovering descriptors properly would
+        // be one more round trip for a handle that is fixed by construction.
+        Ok(Some(VolumeControlHandles {
+            state: state.value_handle,
+            state_cccd: state.value_handle + 1,
+            control_point: control_point.value_handle,
+        }))
+    }
+
+    /// Finds every Battery Service the device publishes.
+    ///
+    /// Plural on purpose. A pair of earbuds commonly exposes one instance per
+    /// side and sometimes a third for the case, and each is a separate primary
+    /// service with its own Battery Level characteristic. Reading only the first
+    /// one reports the left earbud's charge as though it were the device's, and
+    /// then the number stops moving when that side is the one still full.
+    ///
+    /// Absence is normal, not an error: plenty of headphones publish no battery
+    /// information at all over GATT.
+    pub fn discover_batteries(&mut self) -> Result<Vec<BatteryHandles>> {
+        let services = self.discover_services()?;
+        let mut found = Vec::new();
+
+        for range in services
+            .iter()
+            .filter(|s| s.uuid.as_short() == Some(battery_uuid::SERVICE))
+        {
+            let characteristics = self.discover_characteristics(range)?;
+            let Some(level) = characteristics
+                .iter()
+                .find(|c| c.uuid.as_short() == Some(battery_uuid::LEVEL))
+            else {
+                continue;
+            };
+
+            found.push(BatteryHandles {
+                level: level.value_handle,
+                // The Client Characteristic Configuration descriptor sits
+                // directly after the value it configures, exactly as it does
+                // for volume state.
+                level_cccd: level.value_handle + 1,
+                notifies: level.supports_notify(),
+            });
+        }
+
+        Ok(found)
+    }
+
+    /// Reads one battery level as a percentage, as the specification defines it.
+    pub fn read_battery_level(&mut self, handle: u16) -> Result<Option<u8>> {
+        let value = self.read_characteristic(handle)?;
+        Ok(parse_battery_level(&value))
+    }
+
+    /// Reads the volume the headphones currently hold.
+    pub fn read_volume_state(&mut self, handle: u16) -> Result<Option<crate::vcs::VolumeState>> {
+        let value = self.read_characteristic(handle)?;
+        Ok(crate::vcs::parse_volume_state(&value))
+    }
+
+    /// Approves the volume control point, so writes to it stop being refused.
+    pub fn allow_volume_writes_to(&mut self, handle: u16) {
+        self.write_policy.allow_volume_control_point(handle);
+    }
+
+    pub fn read_audio_capabilities(&mut self) -> Result<AudioCapabilities> {
+        self.exchange_mtu()?;
+
+        let services = self.discover_services()?;
+        let mut capabilities = AudioCapabilities::default();
+
+        let pacs = services
+            .iter()
+            .find(|s| s.uuid.as_short() == Some(pacs_uuid::SERVICE_PACS))
+            .ok_or(LinkError::ServiceMissing(pacs_uuid::SERVICE_PACS))?
+            .clone();
+
+        let pacs_characteristics = self.discover_characteristics(&pacs)?;
+        let service = DiscoveredService {
+            range: pacs,
+            characteristics: pacs_characteristics,
+        };
+
+        if let Some(c) = service.characteristic(pacs_uuid::SINK_PAC) {
+            let value = self.read_characteristic(c.value_handle)?;
+            capabilities.sink_records = PacRecord::parse_characteristic(&value);
+        }
+
+        if let Some(c) = service.characteristic(pacs_uuid::SOURCE_PAC) {
+            let value = self.read_characteristic(c.value_handle)?;
+            capabilities.source_records = PacRecord::parse_characteristic(&value);
+        }
+
+        if let Some(c) = service.characteristic(pacs_uuid::SINK_AUDIO_LOCATIONS) {
+            let value = self.read_characteristic(c.value_handle)?;
+            if value.len() >= 4 {
+                capabilities.sink_locations =
+                    Some(u32::from_le_bytes([value[0], value[1], value[2], value[3]]));
+            }
+        }
+
+        // Four bytes, not two: sink contexts then source contexts. Reading only
+        // the first half meant the microphone direction was never checked at
+        // all, and a device that had made its Source unavailable looked
+        // perfectly ready right up until the stream refused to start.
+        if let Some(c) = service.characteristic(pacs_uuid::AVAILABLE_CONTEXTS) {
+            capabilities.available_contexts_handle = Some(c.value_handle);
+
+            // Subscribe, do not merely read. This characteristic is the one
+            // standard, vendor-neutral announcement that another host wants the
+            // headphones: a headset taken over by a phone withdraws Media from
+            // the set it is offering, and restores it when the phone stops.
+            // Read once at connect time it is a snapshot; subscribed to, it is
+            // the signal that makes handing the headphones back a response to
+            // something rather than a guess on a timer.
+            //
+            // Best effort: a device that does not support notifying here simply
+            // never asks, which is a device without multipoint, not an error.
+            // The CCCD sits immediately after the value it configures.
+            let _ = self.subscribe(c.value_handle + 1);
+
+            let value = self.read_characteristic(c.value_handle)?;
+            let (sink, source) = parse_context_pair(&value);
+            capabilities.available_contexts = sink;
+            capabilities.available_source_contexts = source;
+        }
+
+        if let Some(c) = service.characteristic(pacs_uuid::SUPPORTED_CONTEXTS) {
+            let value = self.read_characteristic(c.value_handle)?;
+            let (sink, source) = parse_context_pair(&value);
+            capabilities.supported_contexts = sink;
+            capabilities.supported_source_contexts = source;
+        }
+
+        // ASCS tells us how many streams can run at once, and their ids.
+        if let Some(ascs) = services
+            .iter()
+            .find(|s| s.uuid.as_short() == Some(pacs_uuid::SERVICE_ASCS))
+        {
+            let ascs = ascs.clone();
+            for characteristic in self.discover_characteristics(&ascs)? {
+                let uuid = characteristic.uuid.as_short();
+                if uuid != Some(pacs_uuid::SINK_ASE) && uuid != Some(pacs_uuid::SOURCE_ASE) {
+                    continue;
+                }
+
+                // First byte of an ASE value is its id.
+                if let Ok(value) = self.read_characteristic(characteristic.value_handle) {
+                    if let Some(&ase_id) = value.first() {
+                        if !self.ase_value_handles.iter().any(|(id, _)| *id == ase_id) {
+                            self.ase_value_handles.push((ase_id, characteristic.value_handle));
+                        }
+                        if uuid == Some(pacs_uuid::SINK_ASE) {
+                            capabilities.sink_ase_ids.push(ase_id);
+                        } else {
+                            capabilities.source_ase_ids.push(ase_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(capabilities)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bap::Preset;
+
+    /// Draining the held queue and handing it back must leave it unchanged and,
+    /// above all, must terminate. Returning events one at a time from inside the
+    /// drain loop spun forever, and because the spin sat between reading ACL and
+    /// answering it, the peer saw a host that had gone silent mid-handshake.
+    #[test]
+    fn inspecting_held_events_terminates_and_preserves_order() {
+        let held: RefCell<VecDeque<Event>> = RefCell::new(VecDeque::new());
+        for code in [0x05u8, 0x0E, 0x13] {
+            held.borrow_mut().push_back(Event { code, params: vec![code] });
+        }
+
+        // The same drain-then-restore shape the ACL wait uses.
+        let mut inspected = Vec::new();
+        while let Some(event) = held.borrow_mut().pop_front() {
+            inspected.push(event);
+        }
+        for event in inspected.into_iter().rev() {
+            held.borrow_mut().push_front(event);
+        }
+
+        let codes: Vec<u8> = held.borrow().iter().map(|e| e.code).collect();
+        assert_eq!(codes, vec![0x05, 0x0E, 0x13], "order must survive a round trip");
+    }
+
+    #[test]
+    fn capabilities_default_to_empty() {
+        let caps = AudioCapabilities::default();
+        assert!(caps.sink_records.is_empty());
+        assert!(caps.sink_ase_ids.is_empty());
+    }
+
+    #[test]
+    fn service_lookup_matches_by_short_uuid() {
+        use crate::att::Uuid;
+
+        let service = DiscoveredService {
+            range: ServiceRange {
+                start_handle: 0x0001,
+                end_handle: 0x0010,
+                uuid: Uuid::Short(pacs_uuid::SERVICE_PACS),
+            },
+            characteristics: vec![Characteristic {
+                declaration_handle: 0x0002,
+                properties: 0x12,
+                value_handle: 0x0003,
+                uuid: Uuid::Short(pacs_uuid::SINK_PAC),
+            }],
+        };
+
+        assert!(service.characteristic(pacs_uuid::SINK_PAC).is_some());
+        assert!(service.characteristic(pacs_uuid::SOURCE_PAC).is_none());
+        assert_eq!(
+            service.characteristic(pacs_uuid::SINK_PAC).unwrap().value_handle,
+            0x0003
+        );
+    }
+
+    #[test]
+    fn two_ase_ids_mean_two_cis_are_possible() {
+        // A device exposing two sink ASEs is the layout that makes Windows set up
+        // two CIS. Knowing the count is what lets us choose one stream instead.
+        let mut caps = AudioCapabilities::default();
+        caps.sink_ase_ids = vec![1, 2];
+
+        assert_eq!(caps.sink_ase_ids.len(), 2);
+
+        // With stereo-in-one-stream support we only need the first.
+        let config = Preset::WindowsDefault.codec(true);
+        assert_eq!(config.channel_count(), 2);
+    }
+}

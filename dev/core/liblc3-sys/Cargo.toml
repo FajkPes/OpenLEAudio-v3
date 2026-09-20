@@ -1,0 +1,12 @@
+[package]
+name = "liblc3-sys"
+version = "0.1.0"
+edition = "2021"
+description = "Bindings to Google's reference LC3 codec (github.com/google/liblc3), built from vendored C sources"
+links = "lc3"
+
+# The codec is compiled from source rather than linked against a prebuilt
+# library. liblc3 ships only a Makefile and a meson build, both of which assume
+# a Linux toolchain; cc drives MSVC directly and needs neither.
+[build-dependencies]
+cc = "1"
