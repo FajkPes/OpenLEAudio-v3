@@ -1,8 +1,12 @@
 # OpenLEAudio 3.0
 
-First release considered ready for everyday use. The headline is connection
-reliability: three separate faults made the stack look like broken headphone
-firmware, and all three are fixed.
+## Version 3.0 highlights
+
+- **Full Google/Android connection flow:** this version uses the full Google/Android-style LE Audio connection procedure, so connection establishment behaves like Android.
+- **1M mode finally works:** LE Audio connections using the 1M PHY are now working on the tested setup.
+- **Our most reliable version yet:** version 3.0 delivers the most dependable connection experience so far in the author's testing, including more reliable connection establishment and reconnection.
+
+These results reflect testing with the JBL TUNE 780NC and ASUS USB-BT600. Behavior on other hardware has not yet been verified.
 
 > Settings reset to their defaults on first run - several defaults changed.
 
