@@ -1,10 +1,16 @@
-# OpenLEAudio 3.0 for Windows x64
+# OpenLEAudio 4.0.2 for Windows x64
 
 This directory is the ready-to-run end-user package. It does not contain source code, tests, packet captures, or development tools.
 
+Version 4.0.2 fixes stereo buffer accounting, reconnect with private Bluetooth
+addresses, late connection cancellation, stale packets, and atomic saving of
+settings/pairings. The Range / stability profile remains the default. A 44.1 kHz
+Windows source is converted automatically; choose a supported LE Audio stream
+rate such as 48 kHz. Direct 44.1 kHz LE Audio timing is not supported yet.
+
 ## Start the application
 
-Run `START OpenLEAudio 2.bat`. The launcher checks for:
+Run `START OpenLEAudio 4.bat`. The launcher checks for:
 
 - Microsoft .NET 8 Desktop Runtime x64
 - Microsoft Windows App Runtime 1.8 x64
@@ -28,7 +34,7 @@ If the custom stack does not work, run `RESTORE Windows Bluetooth driver.bat` as
 
 ## Package contents
 
-- `OpenLEAudio/`: application and audio core
+- `OpenLEAudio4/`: application and audio core
 - `driver/`: WinUSB INF and signed catalog
 - `scripts/`: the three administrative scripts used by Setup
 - `dependencies/`: optional cache for Microsoft runtime installers

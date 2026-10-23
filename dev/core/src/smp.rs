@@ -28,6 +28,7 @@ pub mod smp_op {
     pub const PAIRING_FAILED: u8 = 0x05;
     pub const ENCRYPTION_INFORMATION: u8 = 0x06;
     pub const IDENTITY_INFORMATION: u8 = 0x08;
+    pub const SECURITY_REQUEST: u8 = 0x0B;
     pub const PAIRING_PUBLIC_KEY: u8 = 0x0C;
     pub const PAIRING_DHKEY_CHECK: u8 = 0x0D;
 }

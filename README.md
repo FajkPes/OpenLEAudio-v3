@@ -1,4 +1,7 @@
-# OpenLEAudio
+> **Current release: OpenLEAudio 4.0.2, including connection fixes from 2026-10-21.**
+> This repository keeps its historical `OpenLEAudio-v3` URL so existing links continue to work. Download the Windows package from Releases; generated application binaries are distributed there.
+
+# OpenLEAudio v4
 
 **A configurable Bluetooth LE Audio stack for Windows that runs in user space.**
 
@@ -16,6 +19,11 @@ own one and it worked. Hopefully it would also work with your LE Audio headphone
  | [Development](dev/README-development.md)
 
 ---
+
+## Version 4
+
+The default Range / stability profile negotiates the codec automatically and uses
+1M audio PHY. The control link also defaults to 1M. See [v4 changes and validation](dev/docs/v4-stability.md).
 
 ## What it does
 
@@ -51,7 +59,7 @@ back, and what the headphones asked for instead.
 ## Getting started
 
 1. Download the ZIP from [Releases](https://github.com/FajkPes/OpenLEAudio-v3/releases/latest) and extract it somewhere writable.
-2. Run `START OpenLEAudio 2.bat`.
+2. Run `START OpenLEAudio 4.bat`.
 3. Work through the four steps on the **Setup** page: sign the driver, pick the
    adapter, switch it over, configure VB-CABLE.
 4. Go to **Devices**, search, and pair your headphones.
@@ -87,7 +95,7 @@ limiter.
 
 ## Status
 
-Version 3.0 is the first release considered ready for everyday use, and it still
+Version 4.0 focuses on connection recovery and stability under CPU load. It still
 changes a driver binding on your machine. Use a dedicated USB Bluetooth adapter,
 keep a Windows-stack adapter available when possible, and use the included
 restore tool if you need to return the selected adapter to the Windows driver.

@@ -1,8 +1,8 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-set "OUT=OpenLEAudio"
-powershell.exe -NoProfile -NonInteractive -Command "if (Get-Process -Name 'OpenLEAudio2','OpenLEAudio2.Client' -ErrorAction SilentlyContinue) { exit 1 }"
+set "OUT=OpenLEAudio4"
+powershell.exe -NoProfile -NonInteractive -Command "if (Get-Process -Name 'OpenLEAudio2','OpenLEAudio2.Client','OpenLEAudio4','OpenLEAudio4.Client' -ErrorAction SilentlyContinue) { exit 1 }"
 if errorlevel 1 (
     echo Close the running OpenLEAudio application through its tray icon first.
     pause
@@ -44,25 +44,25 @@ if "%MISSING%"=="1" (
     if errorlevel 1 exit /b 1
 )
 
-if not exist "%OUT%\OpenLEAudio2.exe" (
-    echo OpenLEAudio2.exe is missing. Download or rebuild the complete release package.
+if not exist "%OUT%\OpenLEAudio4.exe" (
+    echo OpenLEAudio4.exe is missing. Download or rebuild the complete release package.
     pause
     exit /b 1
 )
-if not exist "%OUT%\OpenLEAudio2.Client.exe" (
-    echo OpenLEAudio2.Client.exe is missing. Download or rebuild the complete release package.
+if not exist "%OUT%\OpenLEAudio4.Client.exe" (
+    echo OpenLEAudio4.Client.exe is missing. Download or rebuild the complete release package.
     pause
     exit /b 1
 )
-if not exist "%OUT%\OpenLEAudio2.pri" (
-    echo OpenLEAudio2.pri is missing. The user interface cannot load without this file.
+if not exist "%OUT%\OpenLEAudio4.pri" (
+    echo OpenLEAudio4.pri is missing. The user interface cannot load without this file.
     echo Download or rebuild the complete release package.
     pause
     exit /b 1
 )
-start "" "%OUT%\OpenLEAudio2.exe"
+start "" "%OUT%\OpenLEAudio4.exe"
 timeout /t 5 /nobreak >nul
-tasklist /FI "IMAGENAME eq OpenLEAudio2.exe" 2>nul | find /I "OpenLEAudio2.exe" >nul
+tasklist /FI "IMAGENAME eq OpenLEAudio4.exe" 2>nul | find /I "OpenLEAudio4.exe" >nul
 if errorlevel 1 (
     echo.
     echo OpenLEAudio closed during startup.

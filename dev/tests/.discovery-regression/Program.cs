@@ -133,6 +133,19 @@ public class Program {
         p._paired.Add(new DeviceRow { Address="P",Name="Paired",Paired=true,LeAudio=true });
         var paired=p._paired[0]; p.Report("P", "(unnamed)", -45);
         Check(ReferenceEquals(paired,p._paired[0]) && paired.Name=="Paired", "Paired RSSI update retains row and name");
+        p.Report("P", "70:E7:18:A7:DF:85", -44);
+        Check(p._paired[0].Name=="Paired", "A random Bluetooth address must not replace the paired name");
+        Check(!UsefulDeviceName("70E718A7DF85","P"), "Compact Bluetooth addresses are not names");
+        var startupRows = new[] {
+            new DeviceRow { Address="A", LeAudio=true },
+            new DeviceRow { Address="B", LeAudio=true },
+            new DeviceRow { Address="C", LeAudio=false }
+        };
+        Check(SelectStartupCandidate(startupRows,"a", a=>a=="B")?.Address=="B", "Unstarred preferred device must not be auto-connected");
+        Check(SelectStartupCandidate(startupRows,"b", a=>true)?.Address=="B", "Preferred address match is case-insensitive");
+        Check(SelectStartupCandidate(startupRows,"", a=>false) is null, "No favorite means no automatic connection");
+        Check(SelectStartupCandidate(startupRows,"", a=>a=="C") is null, "Fallback requires LE Audio");
+        Console.WriteLine("PASS: startup authorization, preference, LE Audio fallback");
         Console.WriteLine("PASS: named grouping, stable order, promotion, sticky names/LE, case-insensitive address, signal notification, row reuse, rescan, paired row");
     }
     private void AddDevice(JsonElement message)
@@ -218,8 +231,17 @@ public class Program {
         }
     }
 
+    private static DeviceRow? SelectStartupCandidate(IEnumerable<DeviceRow> paired,
+        string preferred, Func<string, bool> allowed)
+    {
+        var candidates = paired.Where(row => allowed(row.Address)).ToList();
+        return candidates.FirstOrDefault(row => string.Equals(row.Address, preferred, StringComparison.OrdinalIgnoreCase))
+            ?? candidates.FirstOrDefault(row => row.LeAudio);
+    }
+
     private static bool UsefulDeviceName(string name, string address) =>
         !string.IsNullOrWhiteSpace(name) &&
+        !System.Text.RegularExpressions.Regex.IsMatch(name.Trim(), @"\A(?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}\z|\A[0-9a-fA-F]{12}\z") &&
         !string.Equals(name, address, StringComparison.OrdinalIgnoreCase) &&
         !name.Contains("unnamed", StringComparison.OrdinalIgnoreCase) &&
         !name.Contains("bez jmena", StringComparison.OrdinalIgnoreCase) &&

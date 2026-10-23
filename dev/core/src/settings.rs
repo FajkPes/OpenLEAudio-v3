@@ -236,7 +236,7 @@ pub const KNOBS: &[Knob] = &[
     Knob {
         key: "startup_reconnect_enabled",
         scope: ApplyScope::Immediately,
-        description: "search for and connect headphones for three minutes after automatic startup",
+        description: "connect an authorized saved headset when the app starts",
     },
     Knob {
         key: "language",
@@ -295,18 +295,18 @@ impl Settings {
     /// Version 6 removed `winning_variant`, written by the compatibility
     /// profile that tried six stream shapes in turn. The profile is gone; a file
     /// still naming a shape that no longer exists is only confusing.
-    pub const VERSION: &'static str = "12";
+    pub const VERSION: &'static str = "13";
 
     /// The defaults, which is also what the reset button restores.
     pub fn defaults() -> Self {
         let mut settings = Self::new();
         settings.set("version", Self::VERSION);
-        settings.set("preset", "google");
+        settings.set("preset", "range");
         settings.set("audio_context", "media");
         settings.set("rate_hz", "48000");
         settings.set("frame_ms", "10");
         settings.set("octets", "120");
-        settings.set("phy", "2M");
+        settings.set("phy", "1M");
         settings.set("retransmissions", "13");
         settings.set("max_latency_ms", "95");
         settings.set("presentation_delay_ms", "40");
@@ -361,7 +361,7 @@ impl Settings {
         settings.set("audio_recovery_enabled", "true");
         settings.set("audio_recovery_interval_s", "2");
         settings.set("audio_recovery_window_min", "0");
-        settings.set("acl_phy", "auto");
+        settings.set("acl_phy", "1M");
         settings.set("reconnect_enabled", "true");
         settings.set("reconnect_interval_s", "1");
         settings.set("reconnect_window_min", "15");
@@ -465,7 +465,17 @@ impl Settings {
     pub fn load(path: &std::path::Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                let stored = Self::from_text(&text);
+                let mut stored = Self::from_text(&text);
+                // Upgrade v3 without deleting device, gain, language or user choices.
+                if stored.get("version") == Some("12") {
+                    if stored.get("acl_phy") == Some("auto") { stored.set("acl_phy", "1M"); }
+                    if stored.get("preset") == Some("google") {
+                        stored.set("preset", "range");
+                        stored.set("phy", "1M");
+                    }
+                    stored.set("version", Self::VERSION);
+                    let _ = stored.save(path);
+                }
 
                 if stored.get("version") != Some(Self::VERSION) {
                     let defaults = Self::defaults();
@@ -498,10 +508,7 @@ impl Settings {
     }
 
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, self.to_text())
+        crate::persistence::atomic_write(path, self.to_text().as_bytes())
     }
 }
 
@@ -610,7 +617,7 @@ version = 1
             Some(Some(Duration::from_secs(900)))
         );
         assert_eq!(defaults.number("reconnect_interval_s"), Some(1.0));
-        assert_eq!(defaults.get("preset"), Some("google"));
+        assert_eq!(defaults.get("preset"), Some("range"));
         assert_eq!(defaults.get("audio_context"), Some("media"));
         assert_eq!(defaults.get("multipoint_yield_enabled"), Some("false"));
     }
@@ -621,5 +628,31 @@ version = 1
             assert!(!k.description.is_empty(), "{} has no description", k.key);
             assert!(knob(k.key).is_some());
         }
+    }
+}
+
+#[cfg(test)]
+mod v4_regressions {
+    use super::*;
+    #[test]
+    fn migration_preserves_custom_audio_and_personal_settings() {
+        let path = std::env::temp_dir().join(format!("olea-v4-migration-{}.txt",std::process::id()));
+        std::fs::write(&path, "version = 12\npreset = custom\nphy = 1M\noctets = 80\ngain = 0.7\nlanguage = cs\nacl_phy = auto\n").unwrap();
+        let settings=Settings::load(&path);
+        assert_eq!(settings.get("octets"),Some("80"));
+        assert_eq!(settings.get("gain"),Some("0.7"));
+        assert_eq!(settings.get("language"),Some("cs"));
+        assert_eq!(settings.get("acl_phy"),Some("1M"));
+        assert_eq!(settings.get("version"),Some(Settings::VERSION));
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn defaults_keep_control_and_audio_on_1m_with_recovery_enabled() {
+        let settings=Settings::defaults();
+        assert_eq!(settings.get("preset"),Some("range"));
+        assert_eq!(settings.get("phy"),Some("1M"));
+        assert_eq!(settings.get("acl_phy"),Some("1M"));
+        assert_eq!(settings.bool("audio_recovery_enabled"),Some(true));
+        assert_eq!(settings.bool("reconnect_enabled"),Some(true));
     }
 }

@@ -18,7 +18,9 @@ pub const STACK_PROVENANCE: &str =
 
 /// The name this build answers to. Version 1 is a separate program that must
 /// keep working, so the two must not be confusable.
-pub const BUILD_NAME: &str = "OpenLEAudio 2 - Google";
+pub const BUILD_NAME: &str = "OpenLEAudio 4";
+
+mod persistence;
 
 pub mod audio;
 pub mod att;

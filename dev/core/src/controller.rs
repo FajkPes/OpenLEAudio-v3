@@ -527,6 +527,7 @@ impl Controller {
         // answer to the next attempt, failing it instantly. Start from silence.
         self.clear_queued_events();
         while self.pump.try_recv_event().is_some() {}
+        self.pump.discard_acl();
 
         // Match the generation used for scanning. A controller is entitled to
         // refuse a legacy connection request after extended scanning, and this
@@ -538,11 +539,12 @@ impl Controller {
         };
         self.command(&request)?;
 
-        // Only this peer's answer counts. A connection completing for some other
-        // device would otherwise be taken as ours.
+        // Only successful events have a valid peer address. On failure every
+        // parameter except Status is undefined (Core Vol 4 Part E 4.1.1).
+        // There is only one outstanding initiator procedure on this adapter.
         let event = self.wait_for_event_until(
             timeout,
-            |e| matches!(e.connection_result(), Some((_, _, address)) if address == peer),
+            |e| connection_attempt_completed(e, peer),
             &should_stop,
         )?;
 
@@ -552,7 +554,7 @@ impl Controller {
                 // The controller said why. Passing that on is the difference
                 // between a fixable report and "did not complete".
                 Err(ControllerError::CommandFailed {
-                    opcode: hci::op::LE_EXTENDED_CREATE_CONNECTION,
+                    opcode: u16::from_le_bytes([request[0], request[1]]),
                     status,
                 })
             }
@@ -574,9 +576,21 @@ impl Controller {
                 // discarded by the next attempt's initial flush) while a prompt
                 // automatic retry did not.
                 let _ = self.command(&hci::le_create_connection_cancel());
-                let _ = self.wait_for_event(Duration::from_secs(2), |e| {
-                    e.connection_result().is_some()
-                });
+                let completion = self.wait_for_event(Duration::from_secs(2), |e| {
+                    connection_attempt_completed(e, peer)
+                })?;
+                // Create Connection can win the race with Cancel. A successful
+                // completion is then a live ACL, not a canceled attempt. Adopt
+                // it after a timeout, or explicitly close it after user cancel.
+                if let Some((0, handle, _)) = completion.and_then(|e| e.connection_result()) {
+                    if !should_stop() {
+                        return Ok(Some(handle));
+                    }
+                    self.command(&hci::disconnect(handle, hci::REASON_REMOTE_USER_TERMINATED))?;
+                    self.wait_for_event(Duration::from_secs(3), |e| {
+                        hci::parse_disconnection_complete(e).is_some_and(|(closed, _)| closed == handle)
+                    })?;
+                }
                 self.clear_queued_events();
                 while self.pump.try_recv_event().is_some() {}
                 Ok(None)
@@ -632,6 +646,10 @@ impl Controller {
 /// Advertising reports appear by the hundred while scanning and every one of
 /// them is stale a moment later. Completed-packet counts are produced by every
 /// packet the host sends. Queueing either would grow without bound.
+fn connection_attempt_completed(event: &Event, peer: BdAddr) -> bool {
+    matches!(event.connection_result(), Some((status, _, address)) if status != 0 || address == peer)
+}
+
 fn is_bulk_event(event: &Event) -> bool {
     if !crate::hci::parse_number_of_completed_packets(event).is_empty() {
         return true;
@@ -793,6 +811,25 @@ fn apply_advertising_data(device: &mut DiscoveredDevice, data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_connection_does_not_need_a_valid_peer_address() {
+        let peer = BdAddr([1, 2, 3, 4, 5, 6]);
+        for subevent in [hci::subevt::CONNECTION_COMPLETE, hci::subevt::ENHANCED_CONNECTION_COMPLETE] {
+            let mut event = Event { code: 0x3e, params: vec![0; 31] };
+            event.params[0] = subevent;
+            for status in [0x02, 0x3e, 0x08] {
+                event.params[1] = status;
+                assert!(connection_attempt_completed(&event, peer), "failed event with undefined address");
+            }
+            event.params[1] = 0;
+            assert!(!connection_attempt_completed(&event, peer), "unrelated successful connection");
+            event.params[6..12].copy_from_slice(&peer.0);
+            assert!(connection_attempt_completed(&event, peer));
+        }
+        assert!(!connection_attempt_completed(&Event { code: 0x3e, params: vec![1] }, peer));
+        assert!(!connection_attempt_completed(&Event { code: 0x05, params: vec![0; 31] }, peer));
+    }
 
     #[test]
     fn advertising_report_yields_name_and_services() {

@@ -23,7 +23,7 @@ The stack runs in user mode. Its own code is not loaded into the Windows kernel.
 
 ## Common entry points
 
-- `BUILD application.bat`: builds the Rust core and WinUI application, then updates `../release/OpenLEAudio`
+- `BUILD application.bat`: builds the Rust core and WinUI application, then updates `../release/OpenLEAudio4`
 - `RUN tests.bat`: builds and runs automated tests
 - `PROBE - diagnostics.bat`: reports adapters and audio devices without changing them
 - `ADAPTER - driver status.bat`: reports the active driver for supported adapters

@@ -43,3 +43,12 @@ dev/captures/
 /konzole*.txt
 /soubory bluetooth trace na vývoj/
 OpenLEAudio-*.zip.sha256
+
+/dev/v4-*.log
+/release/OpenLEAudio4/logs/
+
+# Publication copy: installable binaries are GitHub Release assets.
+/dev/tests/.runtime-tmp/
+/dev/*.log
+/release/OpenLEAudio4/
+/release/.bluetooth-management-staging/

@@ -73,10 +73,10 @@ type Result<T> = std::result::Result<T, TransportError>;
 struct CommandFlow {
     credits: u8,
     queued: VecDeque<Vec<u8>>,
-    background: Vec<u16>,
+    pending: Vec<(u16, bool)>,
 }
 impl CommandFlow {
-    fn new() -> Self { Self { credits: 1, queued: VecDeque::new(), background: Vec::new() } }
+    fn new() -> Self { Self { credits: 1, queued: VecDeque::new(), pending: Vec::new() } }
     /// Credits come from the controller, not a guessed timer. Return whether
     /// this is an acknowledgement owned by the background queue.
     fn acknowledge(&mut self, raw: &[u8]) -> bool {
@@ -86,9 +86,8 @@ impl CommandFlow {
             _ => return false,
         };
         self.credits = credits;
-        if let Some(index) = self.background.iter().position(|pending| *pending == opcode) {
-            self.background.remove(index);
-            true
+        if let Some(index) = self.pending.iter().position(|(pending, _)| *pending == opcode) {
+            self.pending.remove(index).1
         } else { false }
     }
 }
@@ -240,13 +239,12 @@ impl UsbTransport {
     /// WinUSB device interface our INF publishes, because that is the only way
     /// to reach the isochronous interface as well.
     pub fn open(info: &DeviceInfo) -> Result<Self> {
-        let _ = info;
+        let path = crate::winusb::find_interface_path_for_device(
+            crate::winusb::OLEA_INTERFACE_GUID, info.instance_id())
+            .map_err(|_| TransportError::DeviceBusy)?;
 
-        let path = crate::winusb::find_interface_path(crate::winusb::OLEA_INTERFACE_GUID)
-            .map_err(|e| TransportError::Usb(e.to_string()))?;
-
-        let interface =
-            WinUsbInterface::open(&path, HCI_INTERFACE).map_err(|_| TransportError::DeviceBusy)?;
+        let interface = WinUsbInterface::open(&path, HCI_INTERFACE).map_err(|error|
+            TransportError::Usb(format!("WinUSB interface is registered but cannot be opened (another OpenLEAudio process may own it): {error}")))?;
 
         // Events and ACL arrive in whatever size the controller has ready, which
         // is almost never the size we asked for.
@@ -343,6 +341,7 @@ impl UsbTransport {
         state.credits -= 1;
         let result = self.send_command_raw(packet);
         if result.is_err() { state.credits += 1; ready.notify_all(); }
+        else { state.pending.push((u16::from_le_bytes([packet[0], packet[1]]), false)); }
         result
     }
 
@@ -372,7 +371,7 @@ impl UsbTransport {
             let Some(packet) = state.queued.pop_front() else { break; };
             let opcode = u16::from_le_bytes([packet[0],packet[1]]);
             match self.send_command_raw(&packet) {
-                Ok(()) => { state.credits -= 1; state.background.push(opcode); }
+                Ok(()) => { state.credits -= 1; state.pending.push((opcode, true)); }
                 Err(error) => crate::trace::note(&format!("queued HCI {opcode:#06x} failed: {error}")),
             }
         }
@@ -527,13 +526,25 @@ mod command_flow_tests {
     use super::*;
     #[test]
     fn background_ack_does_not_complete_a_synchronous_command() {
-        let mut flow = CommandFlow::new(); flow.credits = 0; flow.background.push(0x2013);
+        let mut flow = CommandFlow::new(); flow.credits = 0; flow.pending.push((0x2013, true));
         assert!(!flow.acknowledge(&[0x0f,4,0,0,0x05,0x14]));
         assert_eq!(flow.credits, 0);
         assert!(flow.acknowledge(&[0x0f,4,0x0c,1,0x13,0x20]));
         assert_eq!(flow.credits, 1);
-        assert!(flow.background.is_empty());
+        assert!(flow.pending.is_empty());
         assert!(!flow.acknowledge(&[0x0f,4,0,1,0x13,0x20]));
+    }
+    #[test]
+    fn same_opcode_background_reply_cannot_steal_the_foreground_response() {
+        let mut flow = CommandFlow::new();
+        flow.pending = vec![(0x2013, false), (0x2013, true)];
+        assert!(!flow.acknowledge(&[0x0f, 4, 0, 1, 0x13, 0x20]));
+        assert!(flow.acknowledge(&[0x0f, 4, 0x0c, 2, 0x13, 0x20]));
+        assert!(flow.pending.is_empty());
+        assert_eq!(flow.credits, 2);
+        flow.pending = vec![(0x2013, true), (0x2013, false)];
+        assert!(flow.acknowledge(&[0x0e, 4, 1, 0x13, 0x20, 0]));
+        assert!(!flow.acknowledge(&[0x0e, 4, 2, 0x13, 0x20, 0]));
     }
     #[test]
     fn malformed_or_unrelated_events_do_not_invent_credits() {

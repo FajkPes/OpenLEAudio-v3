@@ -48,7 +48,7 @@ public sealed class AgentClient : IDisposable
     {
         var path = FindAgent()
             ?? throw new FileNotFoundException(
-                "OpenLEAudio2.Client.exe was not found. Build the core with " +
+                "OpenLEAudio4.Client.exe was not found. Build the core with " +
                 "\"cargo build --release\" in the core directory.");
 
         var info = new ProcessStartInfo
@@ -73,7 +73,7 @@ public sealed class AgentClient : IDisposable
 
         var candidates = new List<string>
         {
-            Path.Combine(appDirectory, "OpenLEAudio2.Client.exe"),
+            Path.Combine(appDirectory, "OpenLEAudio4.Client.exe"),
         };
 
         // A developer output directory changes depth between dotnet build and
@@ -219,7 +219,7 @@ public sealed class AgentClient : IDisposable
             _input.WriteLine("{\"cmd\":\"quit\"}");
             _input.Flush();
             _input.Close();
-            _process.WaitForExit(3000);
+            _process.WaitForExit(10000);
         }
         catch (Exception)
         {
@@ -243,6 +243,9 @@ public sealed class AgentClient : IDisposable
         }
 
         _process.Dispose();
-        _writeGate.Dispose();
+        // SendAsync calls may still be waiting for the gate. They must acquire
+        // it, observe _disposing, and release it normally. Disposing it here
+        // races those continuations; it owns no native handle unless its
+        // AvailableWaitHandle is requested, so let GC collect it afterwards.
     }
 }

@@ -113,7 +113,7 @@ fn main() {
         }
 
         match serde_json::from_str::<Value>(line) {
-            Ok(mut command) => {
+            Ok(mut command) if command.is_object() => {
                 let name = command
                     .get("cmd")
                     .and_then(Value::as_str)
@@ -258,6 +258,7 @@ fn main() {
                     break;
                 }
             }
+            Ok(_) => emit(json!({ "event": "error", "text": "command must be a JSON object" })),
             Err(e) => emit(json!({ "event": "error", "text": format!("unreadable command: {e}") })),
         }
     }
@@ -268,6 +269,7 @@ fn main() {
     // orphan - still holding the adapter. The next launch then finds the device
     // taken and reports it as "still owned by another driver", which sends the
     // investigation to the driver binding instead of to this process.
+    cancel_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     playing.store(false, std::sync::atomic::Ordering::Relaxed);
     interrupt.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(commands_tx);
@@ -313,7 +315,7 @@ fn deterministic_configuration_error(error: &str) -> bool {
         "device rejected the custom configuration:",
         "selected gaming mode is not supported",
         "selected media mode is not supported",
-        "stream could not be scheduled:",
+        "stream capabilities incompatible:",
         "headset microphone could not be configured:",
         "custom transport latency exceeds headset limit",
     ]
@@ -494,6 +496,12 @@ fn run_worker(
         }
         emit(json!({ "event": "done", "cmd": name }));
     }
+    // Dropping USB handles alone leaves the controller's ACL alive. Explicitly
+    // release it on quit/EOF so a replacement process can reconnect cleanly.
+    let _ = agent.disconnect();
+    if let Some(mut session) = agent.session.take() {
+        session.shutdown();
+    }
 }
 
 /// The reconnect policy as it stands on disk right now.
@@ -589,7 +597,7 @@ fn apply_setting_change(settings: &mut Settings, key: &str, value: &str) -> Resu
         return Err("setting value is too long or contains a line break".into());
     }
     if key == "preset"
-        && !matches!(value, "google" | "custom" | "windows" | "high-quality" | "low-latency" | "robust")
+        && !matches!(value, "range" | "google" | "custom" | "windows" | "high-quality" | "low-latency" | "robust")
     {
         return Err("unknown stream configuration".into());
     }
@@ -636,6 +644,9 @@ fn apply_setting_change(settings: &mut Settings, key: &str, value: &str) -> Resu
         && !matches!(value, "8000" | "16000" | "24000" | "32000" | "44100" | "48000")
     {
         return Err("unsupported LC3 sample rate".into());
+    }
+    if key == "rate_hz" && value == "44100" {
+        return Err(olea_core::stream::PlanError::Unsupported44100Timing.to_string());
     }
     if matches!(
         key,
@@ -691,7 +702,7 @@ fn apply_setting_change(settings: &mut Settings, key: &str, value: &str) -> Resu
         // is what a capable device gets and what belongs on screen as the
         // default. Leaving these values stale was what made switching to
         // Google/Android look like it did nothing at all.
-        let (codec, qos) = if settings.get("preset") == Some("google") {
+        let (codec, qos) = if matches!(settings.get("preset"), Some("google" | "range")) {
             let order = if settings.get("audio_context") == Some("game") {
                 olea_core::google::GAME_ORDER
             } else {
@@ -742,7 +753,7 @@ fn apply_setting_change(settings: &mut Settings, key: &str, value: &str) -> Resu
             if codec.frame_duration.microseconds() == 7_500 { "7.5" } else { "10" },
         );
         settings.set("octets", codec.octets_per_frame.to_string());
-        settings.set("phy", if qos.phy == 0x01 { "1M" } else { "2M" });
+        settings.set("phy", if settings.get("preset") == Some("range") || qos.phy == 0x01 { "1M" } else { "2M" });
         settings.set("retransmissions", qos.retransmission_number.to_string());
         settings.set("max_latency_ms", qos.max_transport_latency_ms.to_string());
         settings.set("presentation_delay_ms", (qos.presentation_delay_us / 1000).to_string());
@@ -1694,6 +1705,7 @@ impl Agent {
     /// that can interrupt it.
     fn play(&mut self) -> Result<(), String> {
         let mut recovering_since: Option<Instant> = None;
+        let mut failed_rebuilds = 0u32;
         loop {
             let (_, handle) = self.connected.clone().ok_or("no device is connected")?;
             let mut link = self.link.take().ok_or("connection is not open")?;
@@ -1736,11 +1748,16 @@ impl Agent {
                 Ok(recover) => {
                     if self.audio_stable {
                         recovering_since = None;
+                        failed_rebuilds = 0;
                     }
                     recover
                 }
                 Err(error) if recovering_since.is_some() => {
-                    log(format!("audio recovery setup failed: {error}"));
+                    failed_rebuilds += 1;
+                    if failed_rebuilds >= 3 {
+                        return Err(format!("audio recovery failed three setup attempts; reopening Bluetooth: {error}"));
+                    }
+                    log(format!("audio recovery setup failed ({failed_rebuilds}/3): {error}"));
                     true
                 }
                 Err(error) => return Err(error),
@@ -2242,7 +2259,8 @@ impl Agent {
             }
             let recover = matches!(error,
                 olea_core::session::SessionError::AudioDisconnected { .. }
-                    | olea_core::session::SessionError::IsoPath(_));
+                    | olea_core::session::SessionError::IsoPath(_)
+                    | olea_core::session::SessionError::Audio(olea_core::audio::AudioError::Client(_)));
             if !recover {
                 emit(json!({ "event": "error", "cmd": "play", "text": format!("Playback stopped: {error}") }));
             }
@@ -2812,7 +2830,7 @@ mod settings_tests {
         apply_setting_change(&mut settings, "audio_context", "game").unwrap();
 
         let head = olea_core::google::GAME_ORDER[0].setting;
-        assert_eq!(settings.get("preset"), Some("google"));
+        assert_eq!(settings.get("preset"), Some("range"));
         assert_eq!(settings.get("audio_context"), Some("game"));
         assert_eq!(
             settings.number("rate_hz").map(|value| value as u32),
@@ -2916,4 +2934,21 @@ mod recovery_policy_tests {
         apply_setting_change(&mut settings, "audio_recovery_interval_s", "5").unwrap();
         assert_eq!(audio_recovery_policy(&settings).interval, Duration::from_secs(5));
     }
+}
+
+#[cfg(test)]
+mod v4_reconnect_regressions {
+ use super::*;
+ #[test] fn transient_cig_errors_do_not_disable_reconnect() {
+  assert!(!deterministic_configuration_error("stream could not be scheduled: previous CIG could not be removed"));
+  assert!(deterministic_configuration_error("stream capabilities incompatible: no LC3 codec"));
+ }
+ #[test] fn range_profile_keeps_automatic_codec_and_one_megabit_phy() {
+  let mut settings=Settings::defaults();
+  apply_setting_change(&mut settings,"preset","range").unwrap();
+  assert_eq!(settings.get("preset"),Some("range"));
+  assert_eq!(settings.get("phy"),Some("1M"));
+  apply_setting_change(&mut settings,"audio_context","game").unwrap();
+  assert_eq!(settings.get("phy"),Some("1M"));
+ }
 }

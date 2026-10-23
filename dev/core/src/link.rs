@@ -22,6 +22,82 @@ use crate::transport::UsbTransport;
 /// How long any single ATT exchange may take before we give up on it.
 pub const ATT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Peer-initiated ATT traffic is independent of the transaction we are waiting
+/// for (including SMP). Keep its state and reply identical on every read path.
+/// `None` means this PDU still needs the GATT server or response parser.
+fn peer_att_reply(
+    pdu: &[u8],
+    mtu: &mut u16,
+    notifications: &mut Vec<(u16, Vec<u8>)>,
+) -> Option<Vec<u8>> {
+    match pdu.first().copied()? {
+        att_op::EXCHANGE_MTU_REQUEST => {
+            if pdu.len() != 3 {
+                return Some(vec![att_op::ERROR_RESPONSE, att_op::EXCHANGE_MTU_REQUEST, 0, 0, 0x04]);
+            }
+            let peer = u16::from_le_bytes([pdu[1], pdu[2]]);
+            *mtu = peer.clamp(att::ATT_DEFAULT_MTU, att::ATT_PREFERRED_MTU);
+            Some(att::exchange_mtu_response(att::ATT_PREFERRED_MTU))
+        }
+        op @ (att_op::HANDLE_VALUE_NOTIFICATION | att_op::HANDLE_VALUE_INDICATION) => {
+            if let [_, lo, hi, value @ ..] = pdu {
+                notifications.push((u16::from_le_bytes([*lo, *hi]), value.to_vec()));
+            }
+            Some(if op == att_op::HANDLE_VALUE_INDICATION {
+                vec![att_op::HANDLE_VALUE_CONFIRMATION]
+            } else {
+                Vec::new()
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A Security Request can already be in flight when the central starts pairing
+/// or encryption (Core Vol 3 Part H 2.4.6). It is not the next pairing response.
+fn crossing_security_request(pdu: &[u8]) -> bool {
+    matches!(pdu, [crate::smp::smp_op::SECURITY_REQUEST, _])
+}
+
+fn att_response_matches(request: &[u8], response: &[u8]) -> bool {
+    let Some(&opcode) = request.first() else { return false; };
+    if response.first() == Some(&att_op::ERROR_RESPONSE) {
+        response.len() == 5 && response[1] == opcode
+    } else {
+        response.first().copied() == opcode.checked_add(1)
+    }
+}
+
+/// Continue long reads using the size of the last chunk, not the accumulated
+/// value. PACS can span several responses when a peer negotiates a small MTU.
+fn read_attribute_value<F>(handle: u16, mut exchange: F) -> Result<Vec<u8>>
+where
+    F: FnMut(&[u8]) -> Result<(Vec<u8>, u16)>,
+{
+    let (response, mut mtu) = exchange(&att::read_request(handle))?;
+    let mut value = att::parse_read_response(&response)?;
+    let mut chunk_len = value.len();
+    while chunk_len == usize::from(mtu.saturating_sub(1)) && value.len() < 512 {
+        let offset = value.len() as u16;
+        let (response, negotiated_mtu) = exchange(&att::read_blob_request(handle, offset))?;
+        mtu = negotiated_mtu;
+        let chunk = match att::parse_read_response(&response) {
+            Ok(chunk) => chunk,
+            // Errors arrive as wire PDUs, not as errors from exchange(). An
+            // exact-length value can end at Invalid Offset or Attribute Not
+            // Long (the latter only on the first blob). Other errors propagate.
+            Err(AttError::Protocol { code: 0x07, handle: failed }) if failed == handle => break,
+            Err(AttError::Protocol { code: 0x0b, handle: failed })
+                if failed == handle && value.len() == chunk_len => break,
+            Err(error) => return Err(error.into()),
+        };
+        chunk_len = chunk.len();
+        value.extend_from_slice(&chunk);
+    }
+    if value.len() > 512 { return Err(AttError::Malformed("attribute value exceeds 512 bytes").into()); }
+    Ok(value)
+}
+
 /// Handles reserved by the SIG for PACS and ASCS characteristics.
 /// Battery Service, as assigned by the Bluetooth SIG.
 pub mod battery_uuid {
@@ -79,6 +155,9 @@ pub mod pacs_uuid {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LinkError {
+    #[error("previous ATT request did not complete; the Bluetooth connection must be reopened")]
+    AttUnavailable,
+
     #[error("ASCS rejected: {0}")]
     AscsRejected(String),
     #[error(transparent)]
@@ -164,6 +243,7 @@ impl HciPump {
         let event_transport = transport.clone();
         let event_alive = alive.clone();
         let event_reader = thread::spawn(move || {
+            let _priority = crate::audio::AudioThreadPriority::enter();
             let endpoint = event_transport.event_endpoint();
             let mut failures = 0u32;
             while !event_stopped.load(Ordering::Acquire) && event_alive.load(Ordering::Relaxed) {
@@ -209,6 +289,7 @@ impl HciPump {
         let acl_transport = transport.clone();
         let acl_alive = alive.clone();
         let acl_reader = thread::spawn(move || {
+            let _priority = crate::audio::AudioThreadPriority::enter();
             let endpoint = acl_transport.acl_in_endpoint();
             let mut failures = 0u32;
             while !acl_stopped.load(Ordering::Acquire) && acl_alive.load(Ordering::Relaxed) {
@@ -300,6 +381,16 @@ impl HciPump {
         Self::take(self.acl.recv_timeout(timeout), timeout)
     }
 
+    /// Only between ACL connections. Controllers can reuse the same handle,
+    /// so filtering by handle cannot reject an old connection's queued replies.
+    pub fn discard_acl(&self) {
+        let mut discarded = 0;
+        while self.acl.try_recv().is_ok() { discarded += 1; }
+        if discarded != 0 {
+            crate::trace::note(&format!("discarded {discarded} stale ACL packet(s) before connection"));
+        }
+    }
+
     fn take<T>(
         result: std::result::Result<T, RecvTimeoutError>,
         timeout: Duration,
@@ -374,6 +465,9 @@ pub struct Link {
     ascs_control_point: Option<u16>,
     ascs_opcode: Option<u8>,
     att_timeout: Duration,
+    /// ATT has no transaction identifier. Once we abandon an exchange, a late
+    /// response could satisfy a different request on this same bearer.
+    att_unavailable: bool,
     /// The GATT database does not change during one ACL connection. Rewalking
     /// it for PACS, ASCS, volume, battery and teardown cost several identical
     /// ATT round trips on every connect and made later operations race more
@@ -392,7 +486,7 @@ impl Link {
             transport,
             pump,
             handle,
-            reassembler: AclReassembler::new(),
+            reassembler: AclReassembler::for_connection(handle),
             mtu: att::ATT_DEFAULT_MTU,
             max_acl_payload: 27,
             write_policy: crate::safety::WritePolicy::default(),
@@ -400,6 +494,7 @@ impl Link {
             ascs_control_point: None,
             ascs_opcode: None,
             att_timeout: ATT_TIMEOUT,
+            att_unavailable: false,
             services_cache: None,
             characteristics_cache: Vec::new(),
             ase_value_handles: Vec::new(),
@@ -420,6 +515,14 @@ impl Link {
     /// Events and traffic on other channels are skipped rather than treated as
     /// answers, so a notification arriving mid-request does not derail the read.
     fn request(&mut self, pdu: &[u8]) -> Result<Vec<u8>> {
+        if self.att_unavailable { return Err(LinkError::AttUnavailable); }
+        self.att_unavailable = true;
+        let result = self.request_inner(pdu);
+        if result.is_ok() { self.att_unavailable = false; }
+        result
+    }
+
+    fn request_inner(&mut self, pdu: &[u8]) -> Result<Vec<u8>> {
         for packet in att::build_acl_packets(self.handle, cid::ATT, pdu, self.max_acl_payload) {
             self.transport
                 .send_acl(&packet)
@@ -443,45 +546,22 @@ impl Link {
                 continue;
             }
 
-            // Notifications are unsolicited; they are not the response we asked
-            // for - but they are the device's own answer to what we last wrote,
-            // so they are kept rather than dropped. Discarding them is how a
-            // rejected configuration comes to look exactly like an accepted one.
-            match frame.payload.first() {
-                Some(&att_op::HANDLE_VALUE_NOTIFICATION) | Some(&att_op::HANDLE_VALUE_INDICATION) => {
-                    if let &[_, lo, hi, ref value @ ..] = frame.payload.as_slice() {
-                        self.notifications
-                            .push((u16::from_le_bytes([lo, hi]), value.to_vec()));
-                    }
-                    // An indication, unlike a notification, owns the ATT bearer
-                    // until it is confirmed. Without this one-byte answer some
-                    // headsets stop replying to the request that follows it.
-                    if frame.payload.first() == Some(&att_op::HANDLE_VALUE_INDICATION) {
-                        self.send_att_without_wait(&[att_op::HANDLE_VALUE_CONFIRMATION])?;
-                    }
-                    continue;
-                }
-                Some(&att_op::EXCHANGE_MTU_REQUEST) if frame.payload.len() >= 3 => {
-                    // A peripheral may initiate MTU exchange immediately after
-                    // bonded encryption comes back. It can cross our request on
-                    // the wire; treating it as our response produced the exact
-                    // "malformed MTU response" failure seen on the JBL headset.
-                    let peer = u16::from_le_bytes([frame.payload[1], frame.payload[2]]);
-                    self.mtu = att::ATT_PREFERRED_MTU.min(peer).max(att::ATT_DEFAULT_MTU);
-                    self.send_att_without_wait(&att::exchange_mtu_response(att::ATT_PREFERRED_MTU))?;
-                    continue;
-                }
-                _ => {
-                    // The peripheral may be a GATT client at the same time. JBL
-                    // probes the optional host Database Hash (0x2B2A) while our
-                    // primary-service discovery is outstanding. Answer its
-                    // request, then keep waiting for the response to ours.
-                    if crate::media::serve(&self.transport, self.handle, Some(&frame.payload), self.mtu as usize)
-                        .map_err(|e| LinkError::Transport(e.to_string()))? { continue; }
-                    return Ok(frame.payload);
-                }
+            if self.handle_peer_att(&frame.payload)? { continue; }
+            if !att_response_matches(pdu, &frame.payload) {
+                crate::trace::note("ignored ATT response that does not match the outstanding request");
+                continue;
             }
+            return Ok(frame.payload);
         }
+    }
+
+    fn handle_peer_att(&mut self, pdu: &[u8]) -> Result<bool> {
+        if let Some(reply) = peer_att_reply(pdu, &mut self.mtu, &mut self.notifications) {
+            if !reply.is_empty() { self.send_att_without_wait(&reply)?; }
+            return Ok(true);
+        }
+        crate::media::serve(&self.transport, self.handle, Some(pdu), self.mtu as usize)
+            .map_err(|e| LinkError::Transport(e.to_string()))
     }
 
     fn send_att_without_wait(&self, pdu: &[u8]) -> Result<()> {
@@ -614,8 +694,12 @@ impl Link {
             let raw = self.recv_acl_watching_link(deadline, timeout)?;
 
             match self.reassembler.push(&raw) {
-                Ok(Some(frame)) if frame.cid == cid::SMP => return Ok(frame.payload),
+                Ok(Some(frame)) if frame.cid == cid::SMP => {
+                    if crossing_security_request(&frame.payload) { continue; }
+                    return Ok(frame.payload);
+                }
                 Ok(Some(frame)) => {
+                    if frame.cid == cid::ATT { self.handle_peer_att(&frame.payload)?; }
                     Self::answer_signalling(&self.transport, self.handle, self.max_acl_payload, &frame);
                     continue;
                 }
@@ -726,27 +810,10 @@ impl Link {
 
     /// Reads a characteristic, continuing with Read Blob when the value is long.
     pub fn read_characteristic(&mut self, value_handle: u16) -> Result<Vec<u8>> {
-        let response = self.request(&att::read_request(value_handle))?;
-        let mut value = att::parse_read_response(&response)?;
-
-        // A response that exactly fills the MTU may have been truncated.
-        while value.len() == (self.mtu - 1) as usize {
-            let offset = value.len() as u16;
-            let response = match self.request(&att::read_blob_request(value_handle, offset)) {
-                Ok(response) => response,
-                // Reading past the end is how the server signals completion.
-                Err(LinkError::Att(AttError::Protocol { code: 0x07, .. })) => break,
-                Err(e) => return Err(e),
-            };
-
-            let chunk = att::parse_read_response(&response)?;
-            if chunk.is_empty() {
-                break;
-            }
-            value.extend_from_slice(&chunk);
-        }
-
-        Ok(value)
+        read_attribute_value(value_handle, |pdu| {
+            let response = self.request(pdu)?;
+            Ok((response, self.mtu))
+        })
     }
 
     /// Records which handle the stack may write to, learned from discovery.
@@ -837,26 +904,15 @@ impl Link {
             };
 
             if let Ok(Some(frame)) = self.reassembler.push(&raw) {
-                if frame.cid == cid::ATT && crate::media::serve(&self.transport, self.handle,
-                    Some(&frame.payload), self.mtu as usize).unwrap_or(false) { continue; }
+                if frame.cid == cid::ATT && self.handle_peer_att(&frame.payload).unwrap_or(false) {
+                    continue;
+                }
                 if Self::answer_signalling(&self.transport, self.handle, self.max_acl_payload, &frame)
                     .is_some()
                 {
                     continue;
                 }
 
-                if let &[op, lo, hi, ref value @ ..] = frame.payload.as_slice() {
-                    if frame.cid == cid::ATT
-                        && (op == att_op::HANDLE_VALUE_NOTIFICATION
-                            || op == att_op::HANDLE_VALUE_INDICATION)
-                    {
-                        self.notifications
-                            .push((u16::from_le_bytes([lo, hi]), value.to_vec()));
-                        if op == att_op::HANDLE_VALUE_INDICATION {
-                            let _ = self.send_att_without_wait(&[att_op::HANDLE_VALUE_CONFIRMATION]);
-                        }
-                    }
-                }
             }
         }
 
@@ -1210,6 +1266,153 @@ impl Link {
 mod tests {
     use super::*;
     use crate::bap::Preset;
+
+    #[test]
+    fn late_att_response_cannot_complete_a_different_transaction() {
+        assert!(att_response_matches(&[0x02, 5, 2], &[0x03, 0xf7, 0]));
+        assert!(!att_response_matches(&[0x02, 5, 2], &[0x13]));
+        assert!(!att_response_matches(&[0x12, 1, 0, 1], &[0x0b, 80]));
+        assert!(att_response_matches(&[0x0a, 1, 0], &[1, 0x0a, 1, 0, 5]));
+        assert!(!att_response_matches(&[0x0a, 1, 0], &[1, 0x12, 1, 0, 5]));
+        assert!(!att_response_matches(&[0x0a, 1, 0], &[1, 0x0a]));
+        assert!(!att_response_matches(&[], &[]));
+    }
+
+    #[test]
+    fn long_pac_read_continues_after_two_full_chunks() {
+        let expected: Vec<u8> = (0..71).collect();
+        let mut offsets = Vec::new();
+        let value = read_attribute_value(0x42, |pdu| {
+            assert_eq!(&pdu[1..3], &[0x42, 0]);
+            let offset = if pdu[0] == att_op::READ_REQUEST { 0 }
+                else { u16::from_le_bytes([pdu[3], pdu[4]]) as usize };
+            offsets.push(offset);
+            let mut response = vec![if offset == 0 { att_op::READ_RESPONSE } else { att_op::READ_BLOB_RESPONSE }];
+            response.extend(expected.iter().skip(offset).take(22));
+            Ok((response, 23))
+        }).unwrap();
+        assert_eq!(value, expected);
+        assert_eq!(offsets, vec![0, 22, 44, 66]);
+    }
+
+    #[test]
+    fn exact_mtu_multiple_can_end_with_a_wire_invalid_offset() {
+        let mut requests = 0;
+        let value = read_attribute_value(0x42, |pdu| {
+            requests += 1;
+            if requests == 3 {
+                assert_eq!(pdu, &[0x0c, 0x42, 0, 44, 0]);
+                Ok((vec![1, 0x0c, 0x42, 0, 7], 23))
+            } else {
+                let mut response = vec![if requests == 1 { 0x0b } else { 0x0d }];
+                response.extend([0x55; 22]);
+                Ok((response, 23))
+            }
+        }).unwrap();
+        assert_eq!(value, vec![0x55; 44]);
+        assert_eq!(requests, 3);
+    }
+
+    #[test]
+    fn a_long_read_does_not_hide_authentication_or_transport_errors() {
+        for (code, failed, succeeds) in [(0x0b, 0x42, true), (5, 0x42, false), (7, 0x43, false)] {
+            let mut first = true;
+            let result = read_attribute_value(0x42, |_| {
+                if first {
+                    first = false;
+                    let mut response = vec![0x0b];
+                    response.extend([0x55; 22]);
+                    Ok((response, 23))
+                } else { Ok((vec![1, 0x0c, failed, 0, code], 23)) }
+            });
+            assert_eq!(result.is_ok(), succeeds);
+        }
+        assert!(matches!(read_attribute_value(0x42, |_| Err(LinkError::Closed)), Err(LinkError::Closed)));
+    }
+
+    #[test]
+    fn a_full_512_byte_attribute_does_not_probe_beyond_the_gatt_limit() {
+        let mut count = 0;
+        let value = read_attribute_value(0x42, |_| {
+            count += 1;
+            assert_eq!(count, 1);
+            let mut response = vec![0x0b];
+            response.extend([0x55; 512]);
+            Ok((response, 513))
+        }).unwrap();
+        assert_eq!(value.len(), 512);
+    }
+
+    #[test]
+    fn pairing_transcript_survives_crossing_security_mtu_and_indication() {
+        let handle = 0x17;
+        let mut reassembler = AclReassembler::for_connection(handle);
+        let mut mtu = att::ATT_DEFAULT_MTU;
+        let mut notifications = Vec::new();
+        let mut replies = Vec::new();
+        let mut smp = Vec::new();
+        let response = vec![0x02, 3, 0, 9, 16, 0, 2];
+        let mut public_key = vec![0x0c];
+        public_key.extend(0u8..64);
+        // Both ends can initiate security at once. The headset may also start
+        // its GATT client while our pairing exchange is outstanding.
+        for (channel, pdu) in [
+            (cid::SMP, vec![0x0b, 9]),
+            (cid::ATT, vec![0x02, 0xf7, 0]),
+            (cid::SMP, response.clone()),
+            (cid::ATT, vec![0x1d, 0x42, 0, 0xaa]),
+            (cid::SMP, public_key.clone()),
+        ] {
+            for raw in att::build_acl_packets(handle, channel, &pdu, 7) {
+                let Some(frame) = reassembler.push(&raw).unwrap() else { continue; };
+                if frame.cid == cid::ATT {
+                    replies.push(peer_att_reply(&frame.payload, &mut mtu, &mut notifications).unwrap());
+                } else if !crossing_security_request(&frame.payload) {
+                    smp.push(frame.payload);
+                }
+            }
+        }
+        assert_eq!(smp, vec![response, public_key]);
+        assert_eq!(mtu, 247);
+        assert_eq!(replies, vec![vec![0x03, 0x05, 0x02], vec![0x1e]]);
+        assert_eq!(notifications, vec![(0x42, vec![0xaa])]);
+    }
+
+    #[test]
+    fn peer_mtu_exchange_updates_receive_limit_on_every_read_path() {
+        let mut mtu = 23;
+        let mut notifications = Vec::new();
+        for (peer, expected) in [(1u16, 23), (23, 23), (247, 247), (517, 517), (65535, 517)] {
+            let mut pdu = vec![att_op::EXCHANGE_MTU_REQUEST];
+            pdu.extend(peer.to_le_bytes());
+            assert_eq!(peer_att_reply(&pdu, &mut mtu, &mut notifications), Some(vec![3, 5, 2]));
+            assert_eq!(mtu, expected);
+        }
+        for pdu in [&[2][..], &[2, 1], &[2, 1, 0, 0]] {
+            assert_eq!(peer_att_reply(pdu, &mut mtu, &mut notifications), Some(vec![1, 2, 0, 0, 4]));
+            assert_eq!(mtu, 517, "malformed request must not change the limit");
+        }
+    }
+
+    #[test]
+    fn peer_requests_do_not_swallow_our_att_response() {
+        let mut mtu = 23;
+        let mut notifications = Vec::new();
+        for response in [vec![3, 0xf7, 0], vec![0x0b, 42], vec![0x13], vec![1, 0x0a, 1, 0, 0x0a]] {
+            assert_eq!(peer_att_reply(&response, &mut mtu, &mut notifications), None);
+        }
+        assert_eq!(peer_att_reply(&[0x1b, 1, 0, 80], &mut mtu, &mut notifications), Some(vec![]));
+        assert_eq!(notifications, vec![(1, vec![80])]);
+        assert_eq!(mtu, 23);
+    }
+
+    #[test]
+    fn only_complete_security_requests_are_skipped_during_pairing() {
+        assert!(crossing_security_request(&[0x0b, 9]));
+        for pdu in [&[][..], &[0x0b], &[0x0b, 9, 0], &[5, 9], &[2, 3, 0, 9, 16, 0, 2]] {
+            assert!(!crossing_security_request(pdu));
+        }
+    }
 
     /// Draining the held queue and handing it back must leave it unchanged and,
     /// above all, must terminate. Returning events one at a time from inside the

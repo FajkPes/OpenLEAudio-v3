@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -16,6 +16,10 @@ public static class Loc
 
     private static readonly Dictionary<string, string> En = new()
     {
+        ["settings.advanced"] = "Advanced",
+        ["settings.statistics"] = "Statistics",
+        ["settings.advanced_hint"] = "Show advanced settings",
+        ["settings.statistics_hint"] = "Show connection details and statistics",
         ["section.recovery"] = "Audio recovery",
         ["section.recovery.sub"] = "Restore sound while keeping the Bluetooth connection",
         ["setting.audio_recovery_enabled"] = "Automatically recover audio",
@@ -177,7 +181,7 @@ public static class Loc
         ["slider.hold_longer"] = "hold on longer",
         ["setting.reconnect_interval_s"] = "Retry interval (seconds)",
         ["setting.reconnect_window_min"] = "Keep trying for (minutes)",
-        ["setting.startup_reconnect_enabled"] = "Connect after Windows startup",
+        ["setting.startup_reconnect_enabled"] = "Connect when the app starts",
         ["setting.command_style"] = "HCI command addressing", ["setting.microphone_mode"] = "Headset microphone",
         ["setting.playback_source"] = "Playback capture source",
         ["setting.microphone_quality"] = "Microphone quality", ["setting.microphone_target"] = "Microphone destination",
@@ -226,7 +230,7 @@ public static class Loc
         ["desc.reconnect_enabled"] = "Retry after the entire Bluetooth connection is lost. Audio recovery on a retained connection has its own settings.",
         ["desc.reconnect_interval_s"] = "Pause between full Bluetooth connection attempts. Scanning and establishing a connection take additional time.",
         ["desc.reconnect_window_min"] = "How long to retry; 0 means no time limit.",
-        ["desc.startup_reconnect_enabled"] = "After an automatic background launch, look for remembered headphones every five seconds for three minutes.",
+        ["desc.startup_reconnect_enabled"] = "On launch, connect a saved headset allowed by its star. Manual actions cancel startup connection attempts.",
         ["desc.command_style"] = "How HCI commands are addressed over USB.",
         ["desc.playback_source"] = "The Windows capture endpoint sent to the headphones as music.",
         ["desc.microphone_mode"] = "Receive audio from the headset microphone over its Source ASE.",
@@ -262,7 +266,8 @@ public static class Loc
         ["trade.monitor_gain"] = "1.00 is unchanged; boost carefully to avoid feedback or clipping.",
         ["trade.run_in_background"] = "Closing the window hides the client beside the clock.",
         ["trade.start_with_windows"] = "Starts hidden; open it from the notification-area icon.",
-        ["choice.google"] = "Google/Android (recommended)", ["choice.windows"] = "Windows-like (recommended)", ["choice.high_quality"] = "Highest quality",
+        ["choice.range"] = "Range / stability (1M, recommended)",
+        ["choice.google"] = "Google/Android", ["choice.windows"] = "Windows-like (recommended)", ["choice.high_quality"] = "Highest quality",
         ["choice.low_latency"] = "Low latency", ["choice.robust"] = "Resilient connection",
         ["choice.custom"] = "Custom", ["choice.context_media"] = "Music / Media", ["choice.context_game"] = "Gaming / low latency", ["choice.stereo"] = "Stereo (recommended)",
         ["choice.legacy"] = "Compatibility mode", ["choice.mono"] = "Mono",
@@ -335,6 +340,10 @@ public static class Loc
 
     private static readonly Dictionary<string, string> Cs = new()
     {
+        ["settings.advanced"] = "Pokročilé",
+        ["settings.statistics"] = "Statistiky",
+        ["settings.advanced_hint"] = "Zobrazit pokročilá nastavení",
+        ["settings.statistics_hint"] = "Zobrazit podrobnosti a statistiky připojení",
         ["section.recovery"] = "Obnova zvuku",
         ["section.recovery.sub"] = "Návrat zvuku při zachovaném Bluetooth spojení",
         ["setting.audio_recovery_enabled"] = "Automaticky obnovovat zvuk",
@@ -506,7 +515,7 @@ public static class Loc
         ["slider.share_sooner"]="půjčit dřív",
         ["slider.hold_longer"]="držet déle",
         ["setting.reconnect_window_min"]="Zkoušet po dobu (minuty)", ["setting.command_style"]="Adresování HCI příkazů",
-        ["setting.startup_reconnect_enabled"]="Připojit po spuštění Windows",
+        ["setting.startup_reconnect_enabled"]="Připojit po spuštění aplikace",
         ["setting.playback_source"]="Zdroj přehrávaného zvuku",
         ["setting.microphone_mode"]="Mikrofon sluchátek", ["setting.microphone_quality"]="Kvalita mikrofonu",
         ["setting.microphone_target"]="Výstup mikrofonu sluchátek", ["setting.microphone_gain"]="Hlasitost mikrofonu sluchátek",
@@ -554,7 +563,7 @@ public static class Loc
         ["desc.reconnect_enabled"]="Opakuje připojení po ztrátě celého Bluetooth spojení. Obnova zvuku přes zachované spojení má vlastní nastavení.",
         ["desc.reconnect_interval_s"]="Prodleva mezi pokusy o celé Bluetooth spojení. Hledání zařízení a navázání spojení zabere další čas.",
         ["desc.reconnect_window_min"]="Jak dlouho se má zkoušet; 0 znamená bez omezení.",
-        ["desc.startup_reconnect_enabled"]="Po automatickém spuštění na pozadí tři minuty každých pět sekund hledá zapamatovaná sluchátka.",
+        ["desc.startup_reconnect_enabled"]="Po spuštění připojí uložená sluchátka povolená hvězdičkou. Ruční akce zruší automatické připojování při startu.",
         ["desc.command_style"]="Způsob adresování HCI příkazů po USB.",
         ["desc.playback_source"]="Zvukový vstup Windows, který se posílá do sluchátek jako hudba.",
         ["desc.microphone_mode"]="Přijímá zvuk z mikrofonu sluchátek přes jeho Source ASE.",
@@ -590,7 +599,8 @@ public static class Loc
         ["trade.monitor_gain"]="1,00 je beze změny; zesílení může způsobit vazbu nebo ořezání.",
         ["trade.run_in_background"]="Zavření okna aplikaci schová vedle hodin.",
         ["trade.start_with_windows"]="Spustí klienta skrytě; otevřete jej ikonou vedle hodin.",
-        ["choice.google"]="Google/Android (doporučeno)", ["choice.windows"]="Jako Windows (doporučeno)", ["choice.high_quality"]="Nejvyšší kvalita",
+        ["choice.range"]="Dosah / stabilita (1M, doporučeno)",
+        ["choice.google"]="Google/Android", ["choice.windows"]="Jako Windows (doporučeno)", ["choice.high_quality"]="Nejvyšší kvalita",
         ["choice.low_latency"]="Nízká latence", ["choice.robust"]="Odolné spojení", ["choice.custom"]="Vlastní nastavení", ["choice.context_media"]="Hudba / Média", ["choice.context_game"]="Hraní / nízká latence",
         ["choice.stereo"]="Stereo (doporučeno)", ["choice.legacy"]="Kompatibilní režim", ["choice.mono"]="Mono",
         ["choice.mic_off"]="Vypnutý - maximum kvality", ["choice.mic_on"]="Zapnutý - přijímat mikrofon sluchátek",

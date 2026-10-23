@@ -76,6 +76,7 @@ pub fn error_name(code: u8) -> &'static str {
         0x07 => "invalid offset",
         0x08 => "insufficient authorization",
         0x0A => "attribute not found",
+        0x0B => "attribute not long",
         0x0C => "insufficient encryption key size",
         0x0D => "invalid attribute value length",
         0x0F => "insufficient encryption",
@@ -129,6 +130,7 @@ pub fn build_acl_packets(handle: u16, cid: u16, payload: &[u8], max_acl_len: usi
 pub struct AclReassembler {
     buffer: Vec<u8>,
     expected: usize,
+    connection_handle: Option<u16>,
 }
 
 /// A complete L2CAP frame.
@@ -143,6 +145,12 @@ impl AclReassembler {
         Self::default()
     }
 
+    /// ACL and microphone ISO share a bulk pipe. A previous connection can
+    /// also have packets queued during reconnect. Neither belongs to this PDU.
+    pub fn for_connection(handle: u16) -> Self {
+        Self { connection_handle: Some(handle & 0x0fff), ..Self::default() }
+    }
+
     /// Feeds one ACL packet. Returns a frame once enough fragments have arrived.
     ///
     /// A continuation without a start, or a length that never adds up, resets the
@@ -153,6 +161,9 @@ impl AclReassembler {
         }
 
         let header = u16::from_le_bytes([packet[0], packet[1]]);
+        if self.connection_handle.is_some_and(|handle| handle != header & 0x0fff) {
+            return Ok(None);
+        }
         let boundary = ((header >> 12) & 0b11) as u8;
         let data_len = u16::from_le_bytes([packet[2], packet[3]]) as usize;
 
@@ -513,6 +524,21 @@ mod tests {
         let frame = frame.expect("fragments should reassemble into one frame");
         assert_eq!(frame.cid, cid::ATT);
         assert_eq!(frame.payload, payload);
+    }
+
+    #[test]
+    fn stale_acl_and_microphone_iso_cannot_replace_a_partial_att_response() {
+        let payload: Vec<u8> = (0..80).collect();
+        let packets = build_acl_packets(12, cid::ATT, &payload, 27);
+        let stale = build_acl_packets(11, cid::ATT, &[0x0b, 99], 27);
+        let microphone = crate::hci::iso_data_packet(23, 1, &[1; 40]);
+        let mut reassembler = AclReassembler::for_connection(12);
+        assert!(reassembler.push(&packets[0]).unwrap().is_none());
+        assert!(reassembler.push(&stale[0]).unwrap().is_none());
+        assert!(reassembler.push(&microphone).unwrap().is_none());
+        let mut complete = None;
+        for packet in &packets[1..] { complete = reassembler.push(packet).unwrap(); }
+        assert_eq!(complete.unwrap().payload, payload);
     }
 
     /// The regression this codifies cost days: replies from the peer were

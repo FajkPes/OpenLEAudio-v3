@@ -7,7 +7,7 @@
     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     mc:Ignorable="d"
-    Title="OpenLEAudio 2 - Google">
+    Title="OpenLEAudio 4">
 
     <Window.SystemBackdrop>
         <MicaBackdrop />
@@ -437,12 +437,22 @@
             <Grid x:Name="SettingsPage" Visibility="Collapsed" Padding="32,20"
                   RowDefinitions="Auto,Auto,Auto,*,Auto" RowSpacing="14"
                   MaxWidth="1500" HorizontalAlignment="Stretch">
-                    <StackPanel Grid.Row="0" Spacing="2">
-                        <TextBlock Text="Settings" FontSize="26" FontWeight="SemiBold" />
-                        <TextBlock Text="Values are saved automatically and persist after restart."
-                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                   FontSize="12" />
-                    </StackPanel>
+                    <Grid Grid.Row="0" ColumnDefinitions="*,Auto" ColumnSpacing="12">
+                        <StackPanel Spacing="2">
+                            <TextBlock Text="Settings" FontSize="26" FontWeight="SemiBold" />
+                            <TextBlock Text="Values are saved automatically and persist after restart."
+                                       TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                       FontSize="12" />
+                        </StackPanel>
+                        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Top">
+                            <ToggleButton x:Name="AdvancedSettingsButton" Content="Advanced" IsChecked="False"
+                                          Checked="AdvancedSettingsChanged" Unchecked="AdvancedSettingsChanged"
+                                          ToolTipService.ToolTip="Show advanced settings" />
+                            <ToggleButton x:Name="SettingsStatisticsButton" Content="Statistics" IsChecked="False"
+                                          Checked="SettingsStatisticsChanged" Unchecked="SettingsStatisticsChanged"
+                                          ToolTipService.ToolTip="Show connection details and statistics" />
+                        </StackPanel>
+                    </Grid>
 
                     <!-- A reconnect notice belongs to the page flow. Overlaying
                          it on the panels hid the bottom slider rows on short
@@ -492,7 +502,7 @@
                 <StackPanel Spacing="16" HorizontalAlignment="Stretch">
                     <StackPanel Spacing="3">
                         <StackPanel Orientation="Horizontal" Spacing="10">
-                            <TextBlock Text="OpenLEAudio 2" FontSize="28" FontWeight="SemiBold" />
+                            <TextBlock Text="OpenLEAudio 4" FontSize="28" FontWeight="SemiBold" />
                             <TextBlock Text="Google LC3 (liblc3) + Android BAP configuration order"
                                        FontSize="13" Opacity="0.7" TextWrapping="Wrap" />
                             <Border Background="{ThemeResource AccentFillColorDefaultBrush}"

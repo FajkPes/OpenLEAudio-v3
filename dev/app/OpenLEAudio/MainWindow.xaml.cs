@@ -180,6 +180,7 @@ public sealed partial class MainWindow : Window
     private DispatcherQueueTimer? _startupReconnectTimer;
     private DateTimeOffset _startupReconnectUntil;
     private bool _startupReconnectActive;
+    private bool _pairedStatusReady;
 
     // TextBlock stores UTF-16. Half a million characters plus its string is
     // approximately one MiB of retained console history, regardless of how
@@ -255,6 +256,22 @@ public sealed partial class MainWindow : Window
 
     /// The keys currently on the page, so it is rebuilt only when they change.
     private string _settingsShape = "";
+    private readonly List<FrameworkElement> _advancedSettingElements = new();
+    private ScrollViewer? _settingsStatistics;
+    private static bool IsAdvancedSetting(string key) => key is
+        "acl_phy" or "idle_link_latency" or "audio_context" or "gain";
+
+    private void AdvancedSettingsChanged(object sender, RoutedEventArgs e)
+    {
+        var visibility = AdvancedSettingsButton?.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
+        foreach (var element in _advancedSettingElements) element.Visibility = visibility;
+    }
+
+    private void SettingsStatisticsChanged(object sender, RoutedEventArgs e)
+    {
+        if (_settingsStatistics is not null)
+            _settingsStatistics.Visibility = SettingsStatisticsButton?.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
+    }
     private bool _customPreset;
     private ComboBox? _presetBox;
     private readonly List<FrameworkElement> _settingCards = new();
@@ -330,6 +347,7 @@ public sealed partial class MainWindow : Window
         AboutMappingGrid.SizeChanged += AboutMappingGridSizeChanged;
         AboutTimingGrid.SizeChanged += AboutTimingGridSizeChanged;
 
+        StartControllerBridge();
         ConfigureTray();
         AppWindow.Closing += OnAppWindowClosing;
 
@@ -406,10 +424,11 @@ public sealed partial class MainWindow : Window
         AppWindow.Hide();
     }
 
-    /// <summary>For three minutes after a background Windows launch, looks for a
-    /// remembered LE Audio device every five seconds and connects it.</summary>
+    /// <summary>On launch, connects an authorized saved headset. The timer retries
+    /// while initialization is pending; user actions cancel it.</summary>
     public void BeginStartupReconnect()
     {
+        _startupReconnectTimer?.Stop();
         _startupReconnectActive = true;
         _startupReconnectUntil = DateTimeOffset.UtcNow.AddMinutes(3);
         _startupReconnectTimer = _ui.CreateTimer();
@@ -429,15 +448,11 @@ public sealed partial class MainWindow : Window
             _startupReconnectActive = false;
             return;
         }
-        if (!_adapterOn || Busy.IsActive) return;
+        if (!_adapterOn || !_pairedStatusReady || Busy.IsActive) return;
 
-        // The chosen headphones first, then any paired LE Audio device. Falling
-        // back rather than insisting is deliberate: a preferred device that is
-        // switched off should not stop the other pair from connecting.
-        var candidate =
-            _paired.FirstOrDefault(row =>
-                string.Equals(row.Address, _preferredDevice, StringComparison.OrdinalIgnoreCase))
-            ?? _paired.FirstOrDefault(row => row.LeAudio);
+        // Prefer the selected saved headset. Automatic connections only use
+        // devices explicitly authorized with a star.
+        var candidate = SelectStartupCandidate(_paired, _preferredDevice, FavoriteDevices.Contains);
 
         if (candidate is not null)
         {
@@ -447,10 +462,8 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        _found.Clear();
-        Busy.IsActive = true;
-        ScanStatus.Text = Loc.T("status.scanning");
-        Send("scan", new() { ["seconds"] = 3 });
+        StopStartupReconnect();
+        StartScan();
     }
 
     private void ConfigureTray()
@@ -460,7 +473,7 @@ public sealed partial class MainWindow : Window
         menu.Items.Add(Loc.T("tray.exit"), null, (_, _) => ExitFromTray());
         _trayIcon = new System.Windows.Forms.NotifyIcon
         {
-            Text = "OpenLEAudio Client",
+            Text = "OpenLEAudio 4",
             Icon = System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!)
                 ?? System.Drawing.SystemIcons.Application,
             ContextMenuStrip = menu,
@@ -1232,6 +1245,7 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        StopStartupReconnect();
         Busy.IsActive = true;
         ScanStatus.Text = AdapterSwitch.IsOn ? Loc.T("status.turning_on") : Loc.T("status.turning_off");
 
@@ -1247,7 +1261,11 @@ public sealed partial class MainWindow : Window
         Send("adapter", new() { ["on"] = AdapterSwitch.IsOn });
     }
 
-    private void ScanClicked(object sender, RoutedEventArgs e) => StartScan();
+    private void ScanClicked(object sender, RoutedEventArgs e)
+    {
+        StopStartupReconnect();
+        StartScan();
+    }
 
     private void StartScan()
     {
@@ -1263,8 +1281,15 @@ public sealed partial class MainWindow : Window
         Send("scan", new() { ["seconds"] = 6 });
     }
 
+    private void StopStartupReconnect()
+    {
+        _startupReconnectTimer?.Stop();
+        _startupReconnectActive = false;
+    }
+
     private void ConnectClicked(object sender, RoutedEventArgs e)
     {
+        StopStartupReconnect();
         if (sender is not Button { Tag: string address })
         {
             return;
@@ -1472,6 +1497,11 @@ public sealed partial class MainWindow : Window
             case "disconnected":
                 Update(_connectedAddress, row => row.With(connected: false, streaming: false, connecting: false));
                 _connectedAddress = null;
+                _activeConfigurationText = "—";
+                _radioPowerText = "";
+                _qosLimits = "";
+                if (_activeConfiguration is not null) _activeConfiguration.Text = _activeConfigurationText;
+                if (_radioPowerStatus is not null) _radioPowerStatus.Text = _radioPowerText;
                 _healthSamples.Clear();
                 StopUptimeClock();
                 SignalMetric.Text = Loc.T("metrics.signal", "-");
@@ -1522,6 +1552,7 @@ public sealed partial class MainWindow : Window
                 break;
 
             case "reconnect-stopped":
+                Busy.IsActive = false;
                 Update(Text(message, "address"), row => row.With(connecting: false));
                 ShowReconnecting(false);
                 Append(Loc.T("log.reconnect_stopped"));
@@ -1638,6 +1669,7 @@ public sealed partial class MainWindow : Window
         if (message.TryGetProperty("rssi", out var rssiValue) && rssiValue.ValueKind == JsonValueKind.Number)
         {
             rssi = rssiValue.GetInt32();
+            _controllerSignal = rssi;
             line += $", signal {rssi} dBm";
         }
         if (failed > 0)
@@ -2243,7 +2275,9 @@ public sealed partial class MainWindow : Window
     private void OnAdapter(JsonElement message)
     {
         _adapterOn = message.GetProperty("on").GetBoolean();
+        _pairedStatusReady = false;
 
+        _controllerAdapter = Text(message, "version") + " · " + Text(message, "address");
         var version = Text(message, "version");
         var address = Text(message, "address");
         var detail = _adapterOn
@@ -2300,7 +2334,8 @@ public sealed partial class MainWindow : Window
                         // for a general discovery scan added 6-11 seconds to a
                         // background launch even though the bond already holds
                         // the address and address type.
-                        break;
+                        StartupReconnectTick();
+                        if (_startupReconnectActive || Busy.IsActive || _connectedAddress is not null) break;
                     }
                     // Scanning is what the user came for; it follows the radio
                     // coming up without anyone having to ask for it.
@@ -2414,7 +2449,8 @@ public sealed partial class MainWindow : Window
 
         PairedSection.Visibility = rows.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
 
-        // On a background launch, connect directly from the bond as soon as the
+        _pairedStatusReady = true;
+        // On launch, connect directly from the bond as soon as the
         // adapter's status arrives. The normal timer remains a fallback for a
         // headset that is switched on later.
         if (_startupReconnectActive)
@@ -2653,18 +2689,29 @@ public sealed partial class MainWindow : Window
         SettingsHost.ColumnDefinitions.Clear();
         SettingsHost.RowDefinitions.Clear();
         _settingCards.Clear();
+        _advancedSettingElements.Clear();
         _settingCardPanels.Clear();
         _savedMarkers.Clear();
         _codecNotes.Clear();
         PresetHost.Children.Clear();
+        var statistics = new StackPanel();
+        _settingsStatistics = new ScrollViewer
+        {
+            Content = statistics,
+            MaxHeight = 160,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            Visibility = SettingsStatisticsButton.IsChecked == true ? Visibility.Visible : Visibility.Collapsed,
+        };
         _activeConfiguration = new TextBlock { Text = _activeConfigurationText, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(8), FontSize = 12 };
         ToolTipService.SetToolTip(_activeConfiguration, "Aktivní potvrzená konfigurace / Active confirmed configuration");
-        PresetHost.Children.Add(_activeConfiguration);
+        statistics.Children.Add(_activeConfiguration);
         _preflightStatus = new TextBlock { Text = _preflightText, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(8), FontSize = 12 };
-        PresetHost.Children.Add(_preflightStatus);
+        statistics.Children.Add(_preflightStatus);
         _radioPowerStatus = new TextBlock { Text = _radioPowerText, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(8), FontSize = 12 };
         ToolTipService.SetToolTip(_radioPowerStatus, Loc.T("radio.explanation"));
-        PresetHost.Children.Add(_radioPowerStatus);
+        statistics.Children.Add(_radioPowerStatus);
+        PresetHost.Children.Add(_settingsStatistics);
         _presetBox = null;
         LanguageHost.Children.Clear();
         ShowConnectedHint();
@@ -2720,6 +2767,11 @@ public sealed partial class MainWindow : Window
             }
 
             var card = BuildSection(section, present.Select(key => knobs[key]));
+            if (section.Id == "diagnostics")
+            {
+                _advancedSettingElements.Add(card);
+                card.Visibility = AdvancedSettingsButton.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
+            }
             _settingCards.Add(card);
             _settingCardPanels[card] = section.Panel;
             foreach (var key in present) placed.Add(key);
@@ -2739,8 +2791,17 @@ public sealed partial class MainWindow : Window
         LayoutSettingsCards();
     }
 
+    private static DeviceRow? SelectStartupCandidate(IEnumerable<DeviceRow> paired,
+        string preferred, Func<string, bool> allowed)
+    {
+        var candidates = paired.Where(row => allowed(row.Address)).ToList();
+        return candidates.FirstOrDefault(row => string.Equals(row.Address, preferred, StringComparison.OrdinalIgnoreCase))
+            ?? candidates.FirstOrDefault(row => row.LeAudio);
+    }
+
     private static bool UsefulDeviceName(string name, string address) =>
         !string.IsNullOrWhiteSpace(name) &&
+        !System.Text.RegularExpressions.Regex.IsMatch(name.Trim(), @"\A(?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}\z|\A[0-9a-fA-F]{12}\z") &&
         !string.Equals(name, address, StringComparison.OrdinalIgnoreCase) &&
         !name.Contains("unnamed", StringComparison.OrdinalIgnoreCase) &&
         !name.Contains("bez jmena", StringComparison.OrdinalIgnoreCase) &&
@@ -2799,7 +2860,13 @@ public sealed partial class MainWindow : Window
 
         foreach (var knob in knobs)
         {
-            content.Children.Add(Build(knob));
+            var row = Build(knob);
+            if (IsAdvancedSetting(Text(knob, "key")))
+            {
+                _advancedSettingElements.Add(row);
+                row.Visibility = AdvancedSettingsButton.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
+            }
+            content.Children.Add(row);
         }
 
         return new Border
@@ -2863,7 +2930,8 @@ public sealed partial class MainWindow : Window
             // Android path meant a stream could come from either with nothing
             // saying which. Custom stays: choosing inside what the headphones
             // published is the reason this program exists.
-            ("google", Loc.T("choice.google")),
+            ("range", Loc.T("choice.range")),
+                ("google", Loc.T("choice.google")),
             ("custom", Loc.T("choice.custom")),
         });
         _presetBox.VerticalAlignment = VerticalAlignment.Center;
@@ -3110,6 +3178,7 @@ public sealed partial class MainWindow : Window
             "language" => LanguageControl(value),
             "preset" => Choice(key, value, new[]
             {
+                ("range", Loc.T("choice.range")),
                 ("google", Loc.T("choice.google")),
                 ("custom", Loc.T("choice.custom")),
             }),
@@ -3127,7 +3196,7 @@ public sealed partial class MainWindow : Window
             // are frequently incomplete, and a value worth trying should be
             // reachable.
             "rate_hz" => Choice(key, value, new[]
-                { "48000", "44100", "32000", "24000", "16000", "8000" }),
+                { "48000", "32000", "24000", "16000", "8000" }),
             "frame_ms" => Choice(key, value, new[] { "10", "7.5" }),
             "phy" => Choice(key, value, new[] { "2M", "1M" }),
             "acl_phy" => Choice(key, value, new[] { ("auto", Loc.T("choice.acl_auto")), ("1M", "1M"), ("2M", "2M") }),
@@ -3428,7 +3497,7 @@ public sealed partial class MainWindow : Window
         "gain" => "Pre-encoder gain",
         "idle_timeout_min" => "Uspat po tichu (minuty)",
         "reconnect_enabled" => "Automatic reconnect",
-        "startup_reconnect_enabled" => "Connect after Windows startup",
+        "startup_reconnect_enabled" => "Connect when the app starts",
         "reconnect_interval_s" => "Retry interval (seconds)",
         "reconnect_window_min" => "Retry window (minutes)",
         "command_style" => "HCI command addressing",
@@ -3693,7 +3762,10 @@ public sealed partial class MainWindow : Window
             box.Items.Add(option);
         }
 
-        box.SelectedItem = options.Contains(value) ? value : options[0];
+        // Keep an unsupported saved value visible until the user repairs it.
+        // Showing the first option would claim a value the backend never saved.
+        if (!options.Contains(value) && !string.IsNullOrWhiteSpace(value)) box.Items.Add(value);
+        box.SelectedItem = string.IsNullOrWhiteSpace(value) ? options[0] : value;
         box.SelectionChanged += (_, _) => ApplyFromControl(key, box.SelectedItem as string ?? options[0]);
         return box;
     }

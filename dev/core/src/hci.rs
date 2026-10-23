@@ -661,15 +661,16 @@ pub fn parse_number_of_completed_packets(event: &Event) -> Vec<(u16, u16)> {
     }
 
     let count = event.params[0] as usize;
+    // The wire format is an array of (handle, count) pairs, not two arrays.
+    // Reject a truncated event as a whole: partial credit reports are unsafe.
+    if event.params.len() != 1 + count * 4 {
+        return Vec::new();
+    }
     let mut reports = Vec::with_capacity(count);
 
     for index in 0..count {
-        let handle_at = 1 + index * 2;
-        let packets_at = 1 + count * 2 + index * 2;
-
-        if packets_at + 2 > event.params.len() {
-            break;
-        }
+        let handle_at = 1 + index * 4;
+        let packets_at = handle_at + 2;
 
         reports.push((
             u16::from_le_bytes([event.params[handle_at], event.params[handle_at + 1]]),
@@ -684,7 +685,7 @@ pub fn disconnect_reason(reason: u8) -> &'static str {
     match reason {
         0x08 => "spojeni vyprselo (supervision timeout)",
         0x13 => "protejsek spojeni ukoncil",
-        0x14 => "protejsek ukoncil spojeni kvuli nizke baterii",
+        0x14 => "protejsek ukoncil spojeni kvuli nedostatku prostredku",
         0x15 => "protejsek se vypina",
         0x16 => "spojeni ukoncil hostitel",
         0x1A => "protejsek nepodporuje pozadovanou funkci",
@@ -940,7 +941,7 @@ mod tests {
         // Two connections in one event: handle 0x0017 sent 3, 0x0018 sent 1.
         let event = Event {
             code: 0x13,
-            params: vec![0x02, 0x17, 0x00, 0x18, 0x00, 0x03, 0x00, 0x01, 0x00],
+            params: vec![0x02, 0x17, 0x00, 0x03, 0x00, 0x18, 0x00, 0x01, 0x00],
         };
 
         assert_eq!(
@@ -953,6 +954,24 @@ mod tests {
     fn other_events_report_no_completions() {
         let event = Event { code: 0x05, params: vec![0x00, 0x0C, 0x00, 0x13] };
         assert!(parse_number_of_completed_packets(&event).is_empty());
+    }
+
+    #[test]
+    fn batched_acl_and_stereo_completions_release_both_iso_queues() {
+        let mut credits = crate::iso_flow::IsoCredits::new(8, &[0x17, 0x18]);
+        for _ in 0..4 { assert!(credits.reserve_frame(&[0x17, 0x18])); }
+        assert!(!credits.reserve_frame(&[0x17, 0x18]));
+        let raw = [0x13, 13, 3, 0x0c, 0, 2, 0, 0x17, 0, 4, 0, 0x18, 0, 4, 0];
+        let event = Event::parse(&raw).unwrap();
+        for (handle, count) in parse_number_of_completed_packets(&event) {
+            credits.complete(handle, count);
+        }
+        for _ in 0..4 { assert!(credits.reserve_frame(&[0x17, 0x18])); }
+        assert!(!credits.reserve_frame(&[0x17, 0x18]));
+        for end in 1..event.params.len() {
+            let truncated = Event { code: 0x13, params: event.params[..end].to_vec() };
+            assert!(parse_number_of_completed_packets(&truncated).is_empty());
+        }
     }
 
     use super::*;

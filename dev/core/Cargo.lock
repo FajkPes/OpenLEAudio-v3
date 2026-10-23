@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "olea-core"
-version = "1.0.0"
+version = "4.0.2"
 dependencies = [
  "aes",
  "cmac",

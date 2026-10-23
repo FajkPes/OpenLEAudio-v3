@@ -1,4 +1,4 @@
-﻿//! Turning capabilities into a running audio stream.
+//! Turning capabilities into a running audio stream.
 //!
 //! Given what the headphones advertised and which preset the user picked, this
 //! decides the concrete configuration, then walks the ASCS state machine that
@@ -49,6 +49,8 @@ impl Topology {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PlanError {
+    #[error("44.1 kHz LE Audio requires framed ISO and 8.163/10.884 ms timing, which this stack does not yet support; choose 48 kHz (44.1 kHz Windows audio is resampled automatically)")]
+    Unsupported44100Timing,
     #[error("device published no LC3 sink capabilities")]
     NoLc3Sink,
 
@@ -116,6 +118,9 @@ impl StreamPlan {
         qos: QosConfiguration,
         prefer_single_cis: bool,
     ) -> Result<Self, PlanError> {
+        if codec.sampling_frequency == crate::bap::SamplingFrequency::HZ_44100 {
+            return Err(PlanError::Unsupported44100Timing);
+        }
         let records: Vec<_> = capabilities
             .sink_records
             .iter()
@@ -736,7 +741,7 @@ impl AudioEncoder {
     pub fn with_channels(config: CodecConfiguration, channels: usize) -> Self {
         let sample_rate = config.sampling_frequency.hz().unwrap_or(48_000);
         let samples_per_frame =
-            (sample_rate as u64 * config.frame_duration.microseconds() as u64 / 1_000_000) as usize;
+            (lc3_stream_rate(sample_rate) as u64 * config.frame_duration.microseconds() as u64 / 1_000_000) as usize;
 
         let channels = channels.max(1);
         let encoder = build_encoder(
@@ -877,8 +882,8 @@ impl AudioEncoder {
 
     /// Wraps an encoded payload in an HCI ISO data packet.
     ///
-    /// The sequence number must advance by exactly one per SDU; a gap makes the
-    /// controller treat the stream as broken.
+    /// Sequence numbers follow SDU intervals, including gaps when the host misses
+    /// a deadline. Both stereo channels must advance along the same timeline.
     pub fn wrap_iso_packet(&mut self, cis_handle: u16, payload: &[u8]) -> Vec<u8> {
         let slot = match self.sequence_numbers.iter().position(|(h, _)| *h == cis_handle) {
             Some(index) => index,
@@ -891,6 +896,17 @@ impl AudioEncoder {
         let sequence = self.sequence_numbers[slot].1;
         self.sequence_numbers[slot].1 = sequence.wrapping_add(1);
         hci::iso_data_packet(cis_handle, sequence, payload)
+    }
+
+    /// Advance the shared audio timeline without encoding stale catch-up audio.
+    pub fn skip_intervals(&mut self, handles: &[u16], intervals: u64) {
+        for handle in handles {
+            if let Some((_, sequence)) = self.sequence_numbers.iter_mut().find(|(h, _)| h == handle) {
+                *sequence = sequence.wrapping_add(intervals as u16);
+            } else {
+                self.sequence_numbers.push((*handle, intervals as u16));
+            }
+        }
     }
 
     pub fn sequence_number(&self, cis_handle: u16) -> u16 {
@@ -1558,5 +1574,22 @@ mod phy_regression_tests {
             // HCI command header + CIG fixed fields + CIS ID + two SDU lengths.
             assert_eq!(plan.cig_command()[3+15+5],phy);
         }
+    }
+}
+
+#[cfg(test)]
+mod scheduling_regressions {
+    use super::*;
+    #[test]
+    fn skipped_intervals_advance_both_ears_and_wrap() {
+        let mut encoder = AudioEncoder::stereo_pair(Preset::WindowsDefault.codec(false));
+        encoder.skip_intervals(&[23,24], 65535);
+        for handle in [23,24] {
+            let p = encoder.wrap_iso_packet(handle, &[0;4]);
+            assert_eq!(u16::from_le_bytes([p[4],p[5]]),65535);
+        }
+        encoder.skip_intervals(&[23,24], 3);
+        assert_eq!(encoder.sequence_number(23),3);
+        assert_eq!(encoder.sequence_number(24),3);
     }
 }

@@ -55,7 +55,7 @@ pub fn plan(settings: &Settings, capabilities: &AudioCapabilities, prefer_single
             } else {
                 StreamPlan::build_google(&capabilities, prefer_single_cis, None)
             }
-            .map_err(|e| format!("stream could not be scheduled: {e}"))?;
+            .map_err(|e| format!("stream capabilities incompatible: {e}"))?;
 
             let choice = if gaming {
                 StreamPlan::google_game_choice(&capabilities, prefer_single_cis)
@@ -82,6 +82,8 @@ pub fn plan(settings: &Settings, capabilities: &AudioCapabilities, prefer_single
         // chooses the codec; how hard the radio works to deliver it is a
         // separate decision and the user is allowed to make it.
         let mut plan = plan;
+        if chosen == "range" { plan.qos.phy = 0x01; }
+        let preset_label = if chosen == "range" { format!("Range / 1M - {preset_label}") } else { preset_label };
 
         // Exactly what Windows does, and nothing else. The experimental
         // alternatives - swapped ears, other ASE pairs, interleaved packing -
@@ -129,6 +131,9 @@ pub fn plan(settings: &Settings, capabilities: &AudioCapabilities, prefer_single
 }
 pub fn validate(plan: &StreamPlan) -> Result<(),String> {
     for (codec,qos) in std::iter::once((&plan.codec,&plan.qos)).chain(plan.microphone.iter().map(|m|(&m.codec,&m.qos))) {
+        if codec.sampling_frequency == crate::bap::SamplingFrequency::HZ_44100 {
+            return Err(crate::stream::PlanError::Unsupported44100Timing.to_string());
+        }
         crate::safety::check_stream_parameters(codec.octets_per_frame,qos.sdu_interval_us,qos.retransmission_number,qos.max_transport_latency_ms).map_err(str::to_string)?;
         if !matches!(qos.phy,1|2) {return Err("only 1M and 2M are supported".into());}
         if qos.max_sdu!=codec.sdu_size() {return Err("SDU size does not match the selected codec".into());}
@@ -176,3 +181,26 @@ pub fn validate(plan: &StreamPlan) -> Result<(),String> {
         }
     }
 
+
+#[cfg(test)]
+mod range_regressions {
+ use super::*;
+ #[test] fn invalid_44100_timing_is_rejected_before_reaching_the_radio() {
+  let caps=crate::stream::synthetic_capabilities(false,2);
+  let (mut stream,_) = plan(&Settings::defaults(), &caps, false).unwrap();
+  stream.codec.sampling_frequency=crate::bap::SamplingFrequency::HZ_44100;
+  assert!(validate(&stream).unwrap_err().contains("framed ISO"));
+  assert!(matches!(StreamPlan::build_custom(&caps,stream.codec,stream.qos,false),
+      Err(crate::stream::PlanError::Unsupported44100Timing)));
+  // LC3 itself uses 360/480 samples; never assert that it produces 330/441.
+  let encoder=crate::stream::AudioEncoder::new(stream.codec);
+  assert_eq!(encoder.samples_per_frame(),480);
+ }
+ #[test] fn range_keeps_capability_selection_and_sets_one_megabit() {
+  let caps=crate::stream::synthetic_capabilities(false,2);
+  let (plan,label)=plan(&Settings::defaults(),&caps,false).unwrap();
+  assert_eq!(plan.qos.phy,1);
+  assert_eq!(plan.ase_ids.len(),2);
+  assert!(label.starts_with("Range"));
+ }
+}

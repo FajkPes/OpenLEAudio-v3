@@ -181,10 +181,7 @@ impl BondStore {
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, self.to_text())
+        crate::persistence::atomic_write(path, self.to_text().as_bytes())
     }
 }
 

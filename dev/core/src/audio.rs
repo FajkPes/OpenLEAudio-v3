@@ -1,4 +1,4 @@
-﻿//! Capturing Windows audio so it can be encoded and sent to the headphones.
+//! Capturing Windows audio so it can be encoded and sent to the headphones.
 //!
 //! The route is deliberately boring, because boring is what makes it work with
 //! every application rather than a special few:
@@ -503,6 +503,14 @@ unsafe fn format_is_float(format: *const WAVEFORMATEX) -> bool {
     }
 }
 
+/// Drop only complete input frames; never change the interleaved channel phase.
+fn trim_capture_backlog(pending: &mut VecDeque<i16>, channels: usize, keep_frames: usize) -> usize {
+    if channels == 0 { return 0; }
+    let dropped = (pending.len() / channels).saturating_sub(keep_frames);
+    pending.drain(..dropped * channels);
+    dropped
+}
+
 /// A running capture from one endpoint, handing out interleaved stereo samples.
 pub struct AudioCapture {
     client: IAudioClient,
@@ -768,11 +776,14 @@ impl AudioCapture {
             self.resample_phase = 0;
             self.resample_output_rate = rate;
         }
-        if let Some(samples) = pull_resampled(&mut self.pending, &mut self.resample_phase,
-            self.sample_rate, rate, self.channels as usize, frames) {
-            return Ok(Some(samples));
-        }
+        // Drain on every cadence, including while software still has samples.
+        // Otherwise the WASAPI ring can overrun behind a nonempty local queue.
         self.drain_device()?;
+        let keep = (self.sample_rate as usize * 60 / 1000).max(
+            (frames as u64 * self.sample_rate as u64 / rate.max(1) as u64) as usize + 2);
+        if trim_capture_backlog(&mut self.pending, self.channels as usize, keep) > 0 {
+            self.resample_phase = 0;
+        }
         Ok(pull_resampled(&mut self.pending, &mut self.resample_phase,
             self.sample_rate, rate, self.channels as usize, frames))
     }
@@ -1394,5 +1405,22 @@ impl SystemVolume {
                 .SetMute(muted, std::ptr::null())
                 .map_err(|e| AudioError::Com(e.to_string()))
         }
+    }
+}
+
+#[cfg(test)]
+mod backlog_regressions {
+    use super::*;
+    #[test]
+    fn trim_preserves_stereo_phase_and_newest_frames() {
+        let mut samples = VecDeque::from(vec![1, 101, 2, 102, 3, 103, 4, 104]);
+        assert_eq!(trim_capture_backlog(&mut samples, 2, 2), 2);
+        assert_eq!(samples.into_iter().collect::<Vec<_>>(), vec![3, 103, 4, 104]);
+    }
+    #[test]
+    fn short_buffer_keeps_jitter_reserve() {
+        let mut samples = VecDeque::from(vec![1, 2, 3, 4]);
+        assert_eq!(trim_capture_backlog(&mut samples, 2, 20), 0);
+        assert_eq!(samples.len(), 4);
     }
 }

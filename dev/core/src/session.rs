@@ -570,6 +570,17 @@ fn same_virtual_cable(capture: &str, render: &str) -> bool {
     capture_family != "other" && capture_family == family(render)
 }
 
+/// Controller scanning callbacks return true to continue, false to finish.
+fn collect_bond_candidate(bond: &crate::bonding::Bond, device: &DiscoveredDevice,
+    found: &mut Option<DiscoveredDevice>) -> bool {
+    if bond.matches(device.address, device.address_type) {
+        *found = Some(device.clone());
+        false
+    } else {
+        true
+    }
+}
+
 /// Pulls an ATT notification apart, if that is what this frame is.
 fn notification(frame: &crate::att::L2capFrame) -> Option<(u16, &[u8])> {
     if frame.cid != crate::att::cid::ATT {
@@ -580,11 +591,23 @@ fn notification(frame: &crate::att::L2capFrame) -> Option<(u16, &[u8])> {
         return None;
     };
 
-    if opcode != crate::att::att_op::HANDLE_VALUE_NOTIFICATION {
+    if !matches!(opcode, crate::att::att_op::HANDLE_VALUE_NOTIFICATION | crate::att::att_op::HANDLE_VALUE_INDICATION) {
         return None;
     }
 
     Some((u16::from_le_bytes([lo, hi]), value))
+}
+
+fn confirm_indication(transport: &crate::transport::UsbTransport, handle: u16,
+    frame: &crate::att::L2capFrame) -> Result<()> {
+    if notification(frame).is_some()
+        && frame.payload[0] == crate::att::att_op::HANDLE_VALUE_INDICATION {
+        for packet in crate::att::build_acl_packets(handle, crate::att::cid::ATT,
+            &[crate::att::att_op::HANDLE_VALUE_CONFIRMATION], 27) {
+            transport.send_acl(&packet)?;
+        }
+    }
+    Ok(())
 }
 
 /// Keeps the volume on the headphones and the Windows slider showing one number.
@@ -759,6 +782,16 @@ impl Session {
         Ok(())
     }
 
+    /// A failed teardown/USB reader invalidates the adapter, not the user's
+    /// session. Address discovery runs before connect, so it must recover too.
+    fn ensure_adapter<F: FnMut(Progress)>(&mut self, report: F) -> Result<()> {
+        if self.controller.as_ref().is_some_and(|controller| !controller.pump().alive()) {
+            self.shutdown();
+        }
+        if self.controller.is_none() { self.open_adapter(report)?; }
+        Ok(())
+    }
+
     /// Scans for LE Audio devices, ignoring everything that is not one.
     pub fn scan<F: FnMut(Progress)>(&mut self, report: F) -> Result<Vec<DiscoveredDevice>> {
         self.scan_until(report, |_| false)
@@ -780,6 +813,7 @@ impl Session {
         F: FnMut(Progress),
         E: FnMut(&DiscoveredDevice) -> bool,
     {
+        self.ensure_adapter(&mut report)?;
         let controller = self.controller.as_mut().ok_or(SessionError::NoDeviceFound)?;
 
         let mut found: Vec<DiscoveredDevice> = Vec::new();
@@ -848,14 +882,12 @@ impl Session {
 
     /// User-facing scan that a newer command can supersede immediately.
     pub fn find_bond<S: Fn() -> bool>(&mut self, bond: &crate::bonding::Bond, should_stop: S) -> Result<Option<DiscoveredDevice>> {
+        if should_stop() { return Ok(None); }
+        self.ensure_adapter(|_| {})?;
         let controller = self.controller.as_mut().ok_or(SessionError::NoDeviceFound)?;
         let mut found = None;
-        controller.scan_until(Duration::from_secs(3), |device| {
-            if bond.matches(device.address, device.address_type) {
-                found = Some(device.clone());
-                true
-            } else { false }
-        }, should_stop)?;
+        controller.scan_until(Duration::from_secs(3),
+            |device| collect_bond_candidate(bond, device, &mut found), should_stop)?;
         Ok(found)
     }
 
@@ -865,6 +897,7 @@ impl Session {
         F: FnMut(Progress),
         S: Fn() -> bool,
     {
+        self.ensure_adapter(&mut report)?;
         let controller = self.controller.as_mut().ok_or(SessionError::NoDeviceFound)?;
         let duration = self.config.scan_duration;
         let mut found: Vec<DiscoveredDevice> = Vec::new();
@@ -946,12 +979,7 @@ impl Session {
     ) -> Result<u16> {
         if should_stop() { return Err(SessionError::ConnectFailed); }
         crate::media::reset_link();
-        if self.controller.as_ref().is_some_and(|controller| !controller.pump().alive()) {
-            self.shutdown();
-        }
-        if self.controller.is_none() {
-            self.open_adapter(&mut report)?;
-        }
+        self.ensure_adapter(&mut report)?;
         let link_timeout = self.config.link_timeout;
         let controller = self.controller.as_mut().ok_or(SessionError::NoDeviceFound)?;
 
@@ -1943,16 +1971,9 @@ impl Session {
 
         let buffer = self.controller.as_mut().ok_or(SessionError::NoDeviceFound)?
             .command(&hci::command(hci::op::LE_READ_BUFFER_SIZE_V2, &[]))?;
-        if buffer.len() < 7 || buffer[0] != 0 {
-            return Err(SessionError::IsoPath("cannot read controller ISO buffer limits".into()));
-        }
-        let iso_payload_limit = u16::from_le_bytes([buffer[4], buffer[5]]);
-        let iso_capacity = buffer[6] as u16;
-        if iso_capacity < cis_handles.len() as u16 || plan.sdu_size() > iso_payload_limit {
-            return Err(SessionError::IsoPath(format!(
-                "controller ISO buffers cannot carry this stereo frame: {} packets of {} bytes available",
-                iso_capacity, iso_payload_limit)));
-        }
+        let (iso_payload_limit, iso_capacity) = crate::iso_flow::buffer_limits(
+            &buffer, plan.sdu_size(), if plan.playback_enabled { cis_handles.len() } else { 0 })
+            .map_err(SessionError::IsoPath)?;
         let mut credits = crate::iso_flow::IsoCredits::new(iso_capacity, cis_handles);
         let mut backpressure_frames = 0u64;
         crate::trace::note(&format!("ISO flow control: {iso_capacity} packets, {iso_payload_limit} bytes per packet"));
@@ -1978,7 +1999,7 @@ impl Session {
         // it runs. The peer sends its connection parameter request unprompted
         // and then waits a minute for the answer before dropping the link, so
         // this loop has to keep listening even though it has nothing to ask for.
-        let mut acl = crate::att::AclReassembler::new();
+        let mut acl = acl_handle.map(crate::att::AclReassembler::for_connection).unwrap_or_default();
 
         // Full level from the first sample would be a transient in someone's ears.
         let mut soft_start =
@@ -2310,6 +2331,8 @@ impl Session {
                     }
                     let Ok(Some(frame)) = acl.push(&raw) else { continue };
 
+                    confirm_indication(&transport, handle, &frame)?;
+
                     if crate::Link::answer_signalling(&transport, handle, 27, &frame).is_some() {
                         continue;
                     }
@@ -2403,6 +2426,9 @@ impl Session {
             // frame went out immediately instead of on time, and the one after
             // that was late. That is most of the audio "cutting out" during
             // ordinary use.
+            if plan.playback_enabled && Instant::now().saturating_duration_since(next_deadline) >= Duration::from_millis(250) {
+                return Err(SessionError::IsoPath("host scheduling paused for at least 250 ms; rebuilding both channels".into()));
+            }
             let next_samples = match wake_frame.take() {
                 Some(frame) if frame.len() == encoder.samples_per_frame() * 2 => Some(frame),
                 _ => capture.next_frame(encoder.samples_per_frame())?,
@@ -2567,6 +2593,7 @@ impl Session {
                 }
             }
             let mut failure = None;
+            let stereo_started = Instant::now();
             for packet in packets.iter().filter(|_| admitted) {
                 iso_sent += 1;
                 if let Err(e) = transport.send_iso(packet) {
@@ -2584,6 +2611,11 @@ impl Session {
                 return Err(e);
             }
 
+            // Separate synchronous USB writes can straddle CIS intervals after
+            // CPU starvation. Rebuild both ASEs instead of leaving one ear late.
+            if admitted && packets.len() > 1 && stereo_started.elapsed() >= frame_interval {
+                return Err(SessionError::IsoPath("stereo USB submission exceeded one SDU interval; resynchronizing both channels".into()));
+            }
             frames_sent += 1;
 
             if last_report.elapsed() >= Duration::from_secs(1) {
@@ -2608,11 +2640,8 @@ impl Session {
                 });
                 last_report = Instant::now();
 
-                // A backlog that keeps growing means we are not keeping up; dropping
-                // it costs a click but stops latency creeping upward forever.
-                if capture.backlog() > encoder.samples_per_frame() * 8 {
-                    capture.flush();
-                }
+                // Capture bounds its queue in input-rate frames each cadence.
+                // Do not flush the fresh audio and its jitter reserve here.
             }
 
             // Pace to the SDU interval rather than sending as fast as we can encode.
@@ -2620,10 +2649,14 @@ impl Session {
             let now = Instant::now();
             if next_deadline > now {
                 clock.sleep(next_deadline - now);
-            } else if now.duration_since(next_deadline) > frame_interval * 4 {
-                // Far enough behind that catching up frame by frame would mean a
-                // burst of packets the radio cannot deliver anyway.
-                next_deadline = now;
+            } else {
+                // Advance both CIS sequence numbers for elapsed SDU slots.
+                // Never send a catch-up burst into the controller after a stall.
+                let missed = (now.duration_since(next_deadline).as_nanos() / frame_interval.as_nanos()) as u64;
+                if missed > 0 {
+                    encoder.skip_intervals(cis_handles, missed);
+                    next_deadline += frame_interval * (missed.min(u32::MAX as u64) as u32);
+                }
             }
             // Only slightly late: leave the deadline where it is, so the next
             // frame goes out early by the same amount and the cadence recovers
@@ -2702,7 +2735,7 @@ impl Session {
             let controller = self.controller.as_ref().ok_or(SessionError::NoDeviceFound)?;
             controller.pump()
         };
-        let mut acl = crate::att::AclReassembler::new();
+        let mut acl = crate::att::AclReassembler::for_connection(acl_handle);
 
         loop {
             if should_stop() {
@@ -2732,6 +2765,7 @@ impl Session {
 
             while let Ok(raw) = pump.recv_acl(Duration::ZERO) {
                 let Ok(Some(frame)) = acl.push(&raw) else { continue };
+                confirm_indication(&transport, acl_handle, &frame)?;
                 if crate::Link::answer_signalling(&transport, acl_handle, 27, &frame).is_some() {
                     continue;
                 }
@@ -2952,18 +2986,23 @@ impl Session {
         };
 
         let command = crate::hci::disconnect(handle, crate::hci::REASON_REMOTE_USER_TERMINATED);
-        if controller.command(&command).is_err() {
-            return;
+        let closed = match controller.command(&command) {
+            // Unknown Connection Identifier is proof it has already gone.
+            Err(ControllerError::CommandFailed { status: 0x02, .. }) => true,
+            Ok(_) => matches!(controller.wait_for_event(Duration::from_secs(3), |event| {
+                crate::hci::parse_disconnection_complete(event)
+                    .is_some_and(|(closed, _)| closed == handle)
+            }), Ok(Some(_))),
+            Err(_) => false,
+        };
+        if !closed {
+            // A command acknowledgement is not a completed disconnect. Do not
+            // reuse an uncertain controller after announcing Disconnected to
+            // the UI: its Reconnect action immediately submits another connect.
+            // Reopening runs HCI Reset before the next attempt.
+            crate::trace::note("ACL teardown not confirmed; reopening adapter on next connection");
+            self.shutdown();
         }
-
-        // Short: this runs while tearing down, and a peer that has already gone
-        // will never answer. Waiting the full command timeout here is most of
-        // why disconnecting felt like the program had frozen.
-        let _ = controller.wait_for_event(Duration::from_millis(800), |event| {
-            crate::hci::parse_disconnection_complete(event)
-                .map(|(closed, _)| closed == handle)
-                .unwrap_or(false)
-        });
     }
 
     /// Releases the adapter, so something else can open it.
@@ -3150,6 +3189,41 @@ impl AudioDisconnects {
 mod tests {
     use super::*;
     use crate::stream::synthetic_capabilities;
+
+    #[test]
+    fn bond_search_skips_neighbours_and_stops_at_the_resolved_private_address() {
+        let bond = crate::bonding::Bond {
+            address: "00:00:00:00:00:01".into(), address_type: 0,
+            name: "Headset".into(), long_term_key: [0; 16], le_audio: true,
+            identity: Some(crate::privacy::PeerIdentity {
+                irk: [0x9b,0x7d,0x39,0x0a,0xa6,0x10,0x10,0x34,0x05,0xad,0xc8,0x57,0xa3,0x34,0x02,0xec],
+                address: BdAddr([1,0,0,0,0,0]), address_type: 0,
+            }),
+        };
+        let mut found = None;
+        let mut inspected = 0;
+        for address in ["70:81:94:0D:FB:AB", "11:22:33:44:55:66", "70:81:94:0D:FB:AA", "22:22:22:22:22:22"] {
+            let device = DiscoveredDevice { address: BdAddr::parse(address).unwrap(),
+                address_type: 1, name: None, rssi: -50, appearance: None, service_uuids: vec![] };
+            inspected += 1;
+            if !collect_bond_candidate(&bond, &device, &mut found) { break; }
+        }
+        assert_eq!(inspected, 3);
+        assert_eq!(found.unwrap().address.to_string(), "70:81:94:0D:FB:AA");
+    }
+
+    #[test]
+    fn notifications_and_indications_both_update_values_but_reads_do_not() {
+        for opcode in [crate::att::att_op::HANDLE_VALUE_NOTIFICATION, crate::att::att_op::HANDLE_VALUE_INDICATION] {
+            let frame = crate::att::L2capFrame { cid: crate::att::cid::ATT,
+                payload: vec![opcode, 0x42, 0, 75] };
+            assert_eq!(notification(&frame), Some((0x42, &[75][..])));
+        }
+        for (cid, payload) in [(crate::att::cid::ATT, vec![0x0b, 0x42, 0, 75]),
+            (crate::att::cid::SMP, vec![0x1d, 0x42, 0, 75]), (crate::att::cid::ATT, vec![0x1d, 0x42])] {
+            assert!(notification(&crate::att::L2capFrame { cid, payload }).is_none());
+        }
+    }
 
     #[test]
     fn audio_disconnect_does_not_imply_acl_loss() {

@@ -14,8 +14,8 @@ use windows::core::PCWSTR;
 use windows::core::GUID;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
-    SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
-    SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
+    SetupDiGetDeviceInterfaceDetailW, SetupDiGetDeviceInstanceIdW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
+    SP_DEVINFO_DATA, SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
 };
 use windows::Win32::Devices::Usb::{
     WinUsb_ControlTransfer, WinUsb_Free, WinUsb_GetAssociatedInterface, WinUsb_Initialize,
@@ -144,6 +144,16 @@ pub const OLEA_INTERFACE_GUID: GUID = GUID::from_u128(0xB7C4E0A1_3F62_4D18_9E5B_
 /// SetupAPI answers with a variable-length structure, so this asks twice: once
 /// for the size, once for the content.
 pub fn find_interface_path(interface: GUID) -> Result<String> {
+    find_matching_interface_path(interface, None)
+}
+
+/// Match the exact PnP instance, including the USB port/serial identity. VID/PID
+/// alone cannot distinguish two identical adapters on different driver stacks.
+pub fn find_interface_path_for_device(interface: GUID, instance_id: &std::ffi::OsStr) -> Result<String> {
+    find_matching_interface_path(interface, Some(instance_id))
+}
+
+fn find_matching_interface_path(interface: GUID, instance_id: Option<&std::ffi::OsStr>) -> Result<String> {
     unsafe {
         let set = SetupDiGetClassDevsW(
             Some(&interface),
@@ -176,9 +186,23 @@ pub fn find_interface_path(interface: GUID) -> Result<String> {
             let detail = buffer.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
             (*detail).cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
 
-            if SetupDiGetDeviceInterfaceDetailW(set, &data, Some(detail), required, None, None)
+            let mut device = SP_DEVINFO_DATA {
+                cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+                ..Default::default()
+            };
+            if SetupDiGetDeviceInterfaceDetailW(set, &data, Some(detail), required, None, Some(&mut device))
                 .is_ok()
             {
+                if let Some(expected) = instance_id {
+                    let mut id = [0u16; 512];
+                    if SetupDiGetDeviceInstanceIdW(set, &device, Some(&mut id), None).is_err() {
+                        continue;
+                    }
+                    let length = id.iter().position(|unit| *unit == 0).unwrap_or(id.len());
+                    if !String::from_utf16_lossy(&id[..length]).eq_ignore_ascii_case(&expected.to_string_lossy()) {
+                        continue;
+                    }
+                }
                 // DevicePath is a variable-length wide string at the end of the
                 // structure; walk it to its terminator.
                 let path_ptr = std::ptr::addr_of!((*detail).DevicePath) as *const u16;

@@ -8,12 +8,12 @@
     <!-- Version 1 stays installed and has to keep working, so the two
          executables must not be confusable. The namespace is unchanged:
          renaming it would touch every source file for no gain. -->
-    <AssemblyName>OpenLEAudio2</AssemblyName>
-    <Version>2.0.0</Version>
-    <AssemblyVersion>2.0.0.0</AssemblyVersion>
-    <FileVersion>2.0.0.0</FileVersion>
-    <InformationalVersion>2.0 - Google LC3</InformationalVersion>
-    <Product>OpenLEAudio 2 - Google</Product>
+    <AssemblyName>OpenLEAudio4</AssemblyName>
+    <Version>4.0.2</Version>
+    <AssemblyVersion>4.0.2.0</AssemblyVersion>
+    <FileVersion>4.0.2.0</FileVersion>
+    <InformationalVersion>4.0.2 - Bluetooth flow control and recovery</InformationalVersion>
+    <Product>OpenLEAudio 4</Product>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <Platforms>x64</Platforms>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>

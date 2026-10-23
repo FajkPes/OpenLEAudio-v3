@@ -40,6 +40,20 @@ fn report_controllers() {
             summary.product.as_deref().unwrap_or("(no product string)")
         );
 
+        if std::env::args().any(|argument| argument == "--verbose") {
+            println!("            PnP instance: {}", info.instance_id().to_string_lossy());
+            match olea_core::winusb::find_interface_path_for_device(
+                olea_core::winusb::OLEA_INTERFACE_GUID, info.instance_id()) {
+                Ok(path) => {
+                    println!("            WinUSB interface: {path}");
+                    if let Err(error) = olea_core::winusb::WinUsbInterface::open(&path, 0) {
+                        println!("            WinUSB open details: {error}");
+                    }
+                }
+                Err(error) => println!("            WinUSB lookup details: {error}"),
+            }
+        }
+
         match UsbTransport::open(info) {
             Ok(_) => println!("            available - bound to WinUSB, stack can drive it"),
             Err(e) => println!("            {e}"),

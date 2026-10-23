@@ -12,11 +12,11 @@ $relativeTargets = @(
     'dev\tests\.discovery-regression\obj'
 )
 # Refuse cleanup until a complete published application exists.
-$published = @('release\OpenLEAudio') | ForEach-Object {
+$published = @('release\OpenLEAudio4') | ForEach-Object {
     $folder = Join-Path $workspace $_
-    if ((Test-Path -LiteralPath (Join-Path $folder 'OpenLEAudio2.exe')) -and
-        (Test-Path -LiteralPath (Join-Path $folder 'OpenLEAudio2.Client.exe')) -and
-        (Test-Path -LiteralPath (Join-Path $folder 'OpenLEAudio2.pri'))) { $folder }
+    if ((Test-Path -LiteralPath (Join-Path $folder 'OpenLEAudio4.exe')) -and
+        (Test-Path -LiteralPath (Join-Path $folder 'OpenLEAudio4.Client.exe')) -and
+        (Test-Path -LiteralPath (Join-Path $folder 'OpenLEAudio4.pri'))) { $folder }
 }
 if (-not $published) { throw 'No complete published application found; nothing removed.' }
 # Published releases remain usable, including the currently running version.

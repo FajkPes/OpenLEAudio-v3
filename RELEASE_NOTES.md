@@ -1,3 +1,15 @@
+# Version 4.0.2 — Bluetooth flow control and recovery
+
+Fixed batched stereo buffer confirmations, private-address discovery, late connection cancellation, HCI response ownership, stale ACL reassembly, ATT indications, ISO buffer sizing, atomic settings/bond saves, and adapter identity matching. Hardened agent input, UI shutdown and package publication; unsupported 44.1 kHz radio timing is rejected clearly. See [changes and validation](dev/docs/v4.0.2-reliability.md).
+
+# Version 4.0.1 — settings and reconnect
+
+Independent Advanced and Statistics toggles, both off on launch; quieter basic settings; authorized headset reconnect on normal startup; explicit ACL/USB cleanup on exit. See [changes and validation](dev/docs/v4.0.1-settings.md).
+
+# Version 4.0 — range and recovery
+
+Default 1M control/audio profile with automatic codec negotiation, MMCSS readers, bounded stereo queues, scheduling-gap recovery, and corrected retry classification. Includes settings migration and v4 executable/launcher names. See [validation and limitations](dev/docs/v4-stability.md).
+
 # OpenLEAudio 3.0
 
 ## Version 3.0 highlights

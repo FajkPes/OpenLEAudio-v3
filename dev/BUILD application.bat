@@ -4,7 +4,7 @@ cd /d "%~dp0"
 REM A build must not stop active audio or close the tray application automatically.
 REM If either process is running, exit with instructions and leave it untouched.
 powershell.exe -NoLogo -NoProfile -NonInteractive -Command ^
-  "if (Get-Process -Name 'OpenLEAudio2','OpenLEAudio2.Client' -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }"
+  "if (Get-Process -Name 'OpenLEAudio4','OpenLEAudio4.Client' -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }"
 if not errorlevel 1 goto :running
 
 REM Rust/MSVC needs the linker and a valid Windows SDK library path.
@@ -26,17 +26,17 @@ echo.
 echo === application (WinUI 3) ===
 dotnet build -c Release --no-incremental app\OpenLEAudio\OpenLEAudio.csproj || goto :fail
 echo.
-set "OUT=..\release\OpenLEAudio"
+set "OUT=..\release\OpenLEAudio4"
 set "STAGE=..\release\.publish-staging"
 if exist "%STAGE%" powershell.exe -NoProfile -NonInteractive -Command ^
-  "$p=[IO.Path]::GetFullPath('%CD%\%STAGE%'); $release=[IO.Path]::GetFullPath('%CD%\..\release'); if (-not $p.StartsWith($release,[StringComparison]::OrdinalIgnoreCase)) { exit 9 }; Remove-Item -LiteralPath $p -Recurse -Force"
+  "$ErrorActionPreference='Stop'; $p=[IO.Path]::GetFullPath('%CD%\%STAGE%'); $release=[IO.Path]::GetFullPath('%CD%\..\release')+[IO.Path]::DirectorySeparatorChar; if (-not $p.StartsWith($release,[StringComparison]::OrdinalIgnoreCase)) { exit 9 }; Remove-Item -LiteralPath $p -Recurse -Force"
+if errorlevel 1 goto :fail
 dotnet publish -c Release -p:Platform=x64 -o "%STAGE%" app\OpenLEAudio\OpenLEAudio.csproj || goto :fail
-copy /Y core\target\release\OpenLEAudio_Client.exe "%STAGE%\OpenLEAudio2.Client.exe" >nul
+copy /Y core\target\release\OpenLEAudio_Client.exe "%STAGE%\OpenLEAudio4.Client.exe" >nul
 if errorlevel 1 goto :fail
-powershell.exe -NoProfile -NonInteractive -Command ^
-  "$target=[IO.Path]::GetFullPath('%CD%\%OUT%'); $stage=[IO.Path]::GetFullPath('%CD%\%STAGE%'); $release=[IO.Path]::GetFullPath('%CD%\..\release'); if (-not $target.StartsWith($release,[StringComparison]::OrdinalIgnoreCase) -or -not $stage.StartsWith($release,[StringComparison]::OrdinalIgnoreCase)) { exit 9 }; if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }; Move-Item -LiteralPath $stage -Destination $target"
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0scripts\publish-stage.ps1"
 if errorlevel 1 goto :fail
-echo Build complete. Run "..\release\START OpenLEAudio 2.bat".
+echo Build complete. Run "..\release\START OpenLEAudio 4.bat".
 if /I "%~1"=="--no-pause" exit /b 0
 pause
 exit /b 0

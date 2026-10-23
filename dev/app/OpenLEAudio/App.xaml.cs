@@ -13,8 +13,8 @@ public partial class App : Application
     // Version 1 may be installed and running at the same time. Sharing these
     // names with it would make starting this build silently raise version 1's
     // window instead, which looks exactly like this build failing to start.
-    private const string InstanceMutexName = @"Local\OpenLEAudio2.Client.Instance";
-    private const string ShowEventName = @"Local\OpenLEAudio2.Client.Show";
+    private const string InstanceMutexName = @"Local\OpenLEAudio4.Client.Instance";
+    private const string ShowEventName = @"Local\OpenLEAudio4.Client.Show";
 
     private Window? _window;
     private readonly Mutex _instanceMutex;
@@ -80,8 +80,8 @@ public partial class App : Application
             if (System.Environment.GetCommandLineArgs().Contains("--background"))
             {
                 window.StartHidden();
-                window.BeginStartupReconnect();
             }
+            window.BeginStartupReconnect();
         }
         catch (Exception exception)
         {
